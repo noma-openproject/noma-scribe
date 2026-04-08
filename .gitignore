@@ -1,0 +1,70 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── macOS ──
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# ── IDE / editors ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ── Claude / OMC session state ──
+.claude/
+.omc/
+CLAUDE.md
+
+# ── 모델 캐시 (HuggingFace) ──
+.cache/
+*.mlx
+*.safetensors
+
+# ── 오디오 / 전사 결과물 ──
+*.mp3
+*.m4a
+*.wav
+*.webm
+*.ogg
+*.flac
+*.mp4
+*.wma
+*.aac
+transcripts/
+recordings/
+
+# ── 환경변수 / 비밀 ──
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ── 로그 / 임시파일 ──
+*.log
+logs/
+tmp/
+temp/
