@@ -2,109 +2,24 @@
 """noma-scribe: Apple Silicon 로컬 음성 전사 앱.
 
 더블클릭으로 실행하면 브라우저에서 깔끔한 UI가 열립니다.
-오디오 파일을 드래그앤드롭하고 '전사 시작' 버튼만 누르면 끝.
+오디오 파일을 1개 또는 여러 개 드래그앤드롭하고 '전사 시작' 버튼만 누르면 끝.
 """
 
-import os
 import tempfile
-import time
+import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
 import gradio as gr
 
 from core.engine import transcribe, save_result, DEFAULT_MODEL
 from core.presets import load_prompt, list_presets
-from core.utils import format_duration, format_file_size, SUPPORTED_EXTENSIONS
+from core.utils import format_duration, SUPPORTED_EXTENSIONS
 
 
 # ──────────────────────────────────────────────
-# 핵심 로직
+# 헬퍼
 # ──────────────────────────────────────────────
-
-def run_transcription(
-    audio_file,
-    preset: str,
-    custom_prompt: str,
-    language: str,
-    include_timestamps: bool,
-):
-    """전사를 실행하고 결과를 반환한다."""
-    
-    if audio_file is None:
-        gr.Warning("오디오 파일을 먼저 업로드해주세요.")
-        return "", None, ""
-    
-    # 프롬프트 결정: 커스텀 > 프리셋
-    prompt = None
-    if custom_prompt and custom_prompt.strip():
-        prompt = custom_prompt.strip()
-    elif preset and preset != "없음":
-        try:
-            prompt = load_prompt(preset=preset)
-        except Exception:
-            pass
-    
-    # 언어 코드 매핑
-    lang_map = {
-        "한국어": "ko",
-        "English": "en",
-        "日本語": "ja",
-        "中文": "zh",
-        "자동 감지": None,
-    }
-    lang_code = lang_map.get(language, "ko")
-    
-    # 파일 정보
-    audio_path = Path(audio_file)
-    file_size = format_file_size(audio_path)
-    file_name = audio_path.name
-    
-    # 상태 메시지
-    status = f"🎙️ 전사 중... ({file_name}, {file_size})"
-    
-    try:
-        # 전사 옵션
-        options = {
-            "audio_path": str(audio_path),
-            "model": DEFAULT_MODEL,
-            "word_timestamps": include_timestamps,
-        }
-        if lang_code:
-            options["language"] = lang_code
-        if prompt:
-            options["initial_prompt"] = prompt
-        
-        result = transcribe(**options)
-        
-        elapsed = format_duration(result.duration_seconds)
-        
-        # txt 파일 생성
-        output_dir = tempfile.mkdtemp()
-        txt_filename = audio_path.stem + ".txt"
-        txt_path = Path(output_dir) / txt_filename
-        save_result(result, txt_path, include_timestamps=include_timestamps)
-        
-        # 결과 텍스트 구성
-        if include_timestamps and result.segments:
-            display_lines = []
-            for seg in result.segments:
-                start = _fmt_ts(seg["start"])
-                end = _fmt_ts(seg["end"])
-                text = seg["text"].strip()
-                display_lines.append(f"[{start} → {end}] {text}")
-            display_text = "\n".join(display_lines)
-        else:
-            display_text = result.text
-        
-        status = f"✅ 완료! ({elapsed}) — {txt_filename}"
-        
-        return display_text, str(txt_path), status
-        
-    except Exception as e:
-        status = f"❌ 오류: {str(e)}"
-        return "", None, status
-
 
 def _fmt_ts(seconds: float) -> str:
     h = int(seconds // 3600)
@@ -115,30 +30,211 @@ def _fmt_ts(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def _format_body(result, include_timestamps: bool) -> str:
+    """전사 결과를 화면 표시용 텍스트로 변환."""
+    if include_timestamps and result.segments:
+        lines = []
+        for seg in result.segments:
+            start = _fmt_ts(seg["start"])
+            end = _fmt_ts(seg["end"])
+            text = seg["text"].strip()
+            lines.append(f"[{start} → {end}] {text}")
+        return "\n".join(lines)
+    return result.text
+
+
+def _normalize_files(audio_files) -> List[str]:
+    """gr.File의 입력을 항상 파일 경로 리스트로 정규화한다."""
+    if audio_files is None:
+        return []
+    if isinstance(audio_files, (str, Path)):
+        return [str(audio_files)]
+    if isinstance(audio_files, (list, tuple)):
+        out = []
+        for f in audio_files:
+            # gr.File은 dict 또는 NamedString을 줄 수 있음
+            if isinstance(f, dict):
+                out.append(f.get("path") or f.get("name", ""))
+            elif hasattr(f, "name"):
+                out.append(f.name)
+            else:
+                out.append(str(f))
+        return [p for p in out if p]
+    # 단일 객체
+    if hasattr(audio_files, "name"):
+        return [audio_files.name]
+    return [str(audio_files)]
+
+
+# ──────────────────────────────────────────────
+# 핵심 로직 — 배치 전사
+# ──────────────────────────────────────────────
+
+def run_transcription(
+    audio_files,
+    preset: str,
+    custom_prompt: str,
+    language: str,
+    include_timestamps: bool,
+    progress=gr.Progress(),
+):
+    """오디오 파일 1개 또는 N개를 순차 전사한다.
+
+    - 1개  → 단일 .txt 파일을 다운로드 슬롯에 제공
+    - N개  → 각 파일별 .txt를 만들어 transcripts.zip으로 묶어 제공
+    """
+
+    files = _normalize_files(audio_files)
+    if not files:
+        gr.Warning("오디오 파일을 먼저 업로드해주세요.")
+        return "", None, ""
+
+    # 지원 확장자 필터링
+    valid_files = []
+    skipped = []
+    for fp in files:
+        if Path(fp).suffix.lower() in SUPPORTED_EXTENSIONS:
+            valid_files.append(fp)
+        else:
+            skipped.append(Path(fp).name)
+
+    if skipped:
+        gr.Warning(f"지원하지 않는 형식 {len(skipped)}개 무시: {', '.join(skipped[:3])}{'...' if len(skipped) > 3 else ''}")
+
+    if not valid_files:
+        return "", None, "❌ 지원하는 오디오 파일이 없습니다."
+
+    # ── 프롬프트 결정: 커스텀 > 프리셋 ──
+    prompt: Optional[str] = None
+    if custom_prompt and custom_prompt.strip():
+        prompt = custom_prompt.strip()
+    elif preset and preset != "없음":
+        try:
+            prompt = load_prompt(preset=preset)
+        except Exception:
+            pass
+
+    # ── 언어 코드 매핑 ──
+    lang_map = {
+        "한국어": "ko",
+        "English": "en",
+        "日本語": "ja",
+        "中文": "zh",
+        "자동 감지": None,
+    }
+    lang_code = lang_map.get(language, "ko")
+
+    # ── 배치 처리 ──
+    n = len(valid_files)
+    output_dir = Path(tempfile.mkdtemp(prefix="noma-scribe-"))
+    txt_paths: List[Path] = []
+    display_blocks: List[str] = []
+    success_count = 0
+    total_elapsed = 0.0
+
+    progress(0.0, desc=f"준비 중... ({n}개 파일)")
+
+    for idx, fp in enumerate(valid_files, 1):
+        audio_path = Path(fp)
+        progress(
+            (idx - 1) / n,
+            desc=f"{idx}/{n} 전사 중... ({audio_path.name})",
+        )
+
+        try:
+            options = {
+                "audio_path": str(audio_path),
+                "model": DEFAULT_MODEL,
+                "word_timestamps": include_timestamps,
+            }
+            if lang_code:
+                options["language"] = lang_code
+            if prompt:
+                options["initial_prompt"] = prompt
+
+            result = transcribe(**options)
+            total_elapsed += result.duration_seconds
+            success_count += 1
+
+            # 결과 저장
+            txt_filename = audio_path.stem + ".txt"
+            txt_path = output_dir / txt_filename
+            save_result(result, txt_path, include_timestamps=include_timestamps)
+            txt_paths.append(txt_path)
+
+            # 화면 표시 텍스트 누적
+            body = _format_body(result, include_timestamps)
+            if n == 1:
+                display_blocks.append(body)
+            else:
+                header = f"━━━ [{idx}/{n}] {audio_path.name} ━━━"
+                display_blocks.append(f"{header}\n{body}")
+
+        except Exception as e:
+            err = f"❌ 오류: {e}"
+            if n == 1:
+                progress(1.0, desc="실패")
+                return "", None, f"❌ {audio_path.name}: {e}"
+            header = f"━━━ [{idx}/{n}] {audio_path.name} ━━━"
+            display_blocks.append(f"{header}\n{err}")
+
+    progress(1.0, desc="완료")
+
+    if not txt_paths:
+        return "\n\n".join(display_blocks), None, f"❌ 모두 실패 (0/{n})"
+
+    # ── 다운로드 파일 결정 ──
+    if len(txt_paths) == 1:
+        download_path = str(txt_paths[0])
+        download_label = txt_paths[0].name
+    else:
+        zip_path = output_dir / "transcripts.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in txt_paths:
+                zf.write(f, arcname=f.name)
+        download_path = str(zip_path)
+        download_label = f"transcripts.zip ({len(txt_paths)}개)"
+
+    elapsed_str = format_duration(total_elapsed)
+    if n == 1:
+        status = f"✅ 완료! ({elapsed_str}) — {download_label}"
+    else:
+        status = f"✅ 완료! {success_count}/{n}개 ({elapsed_str}) — {download_label}"
+
+    return "\n\n".join(display_blocks), download_path, status
+
+
 # ──────────────────────────────────────────────
 # UI 구성
 # ──────────────────────────────────────────────
 
 def create_app():
-    # 프리셋 목록
     presets = list_presets()
     preset_choices = ["없음"] + list(presets.keys())
 
     with gr.Blocks(title="noma-scribe") as app:
-        
+
         # 헤더
         gr.Markdown("# 🎙️ noma-scribe", elem_classes=["main-title"])
-        gr.Markdown("오디오 파일을 올리고 버튼만 누르면 텍스트로 전사합니다. 완전 로컬, 무료.", elem_classes=["sub-title"])
-        
+        gr.Markdown(
+            "오디오 파일을 1개 또는 여러 개 올리고 버튼만 누르면 텍스트로 전사합니다. "
+            "완전 로컬, 무료.",
+            elem_classes=["sub-title"],
+        )
+
         with gr.Row():
             # ── 왼쪽: 입력 ──
             with gr.Column(scale=1):
-                audio_input = gr.Audio(
-                    label="오디오 파일",
+                audio_input = gr.File(
+                    label="오디오 파일 (여러 개 동시 업로드 가능)",
+                    file_count="multiple",
+                    file_types=[
+                        ".mp3", ".m4a", ".wav", ".webm", ".ogg",
+                        ".flac", ".mp4", ".wma", ".aac",
+                    ],
                     type="filepath",
-                    sources=["upload"],
                 )
-                
+
                 with gr.Accordion("옵션", open=False):
                     preset_dropdown = gr.Dropdown(
                         choices=preset_choices,
@@ -160,13 +256,13 @@ def create_app():
                         label="타임스탬프 포함",
                         value=False,
                     )
-                
+
                 transcribe_btn = gr.Button(
                     "🎙️ 전사 시작",
                     variant="primary",
                     size="lg",
                 )
-            
+
             # ── 오른쪽: 출력 ──
             with gr.Column(scale=1):
                 status_text = gr.Textbox(
@@ -175,30 +271,30 @@ def create_app():
                     elem_classes=["status-box"],
                 )
                 output_text = gr.Textbox(
-                    label="전사 결과",
+                    label="전사 결과 (여러 파일은 구분선으로 분리)",
                     lines=18,
                     max_lines=40,
                     interactive=False,
                 )
                 download_file = gr.File(
-                    label="다운로드",
+                    label="다운로드 (1개=txt, 여러 개=zip)",
                     visible=True,
                 )
-        
+
         # 이벤트 연결
         transcribe_btn.click(
             fn=run_transcription,
             inputs=[audio_input, preset_dropdown, custom_prompt, language, timestamps],
             outputs=[output_text, download_file, status_text],
         )
-        
-        # 프리셋 설명 표시
+
+        # 프리셋 설명
         gr.Markdown(
             "**프리셋 목록**: "
             + " · ".join([f"`{k}` ({v})" for k, v in presets.items()])
             + " · `presets/` 폴더에 txt 파일 추가로 확장 가능"
         )
-    
+
     return app
 
 
@@ -209,7 +305,7 @@ def create_app():
 if __name__ == "__main__":
     app = create_app()
 
-    # Gradio 6.0+: theme/css를 launch()로 이동
+    # Gradio 6.0+: theme/css는 launch()로 전달
     theme = gr.themes.Soft(
         primary_hue="blue",
         neutral_hue="slate",
@@ -226,7 +322,7 @@ if __name__ == "__main__":
         server_name="127.0.0.1",
         server_port=7860,
         share=False,
-        inbrowser=True,  # 자동으로 브라우저 열기
+        inbrowser=True,
         theme=theme,
         css=css,
     )
