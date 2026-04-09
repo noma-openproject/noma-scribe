@@ -111,16 +111,22 @@ python transcribe.py --list-presets
 
 ## 🎯 프리셋
 
+도메인 용어 힌트를 주면 Whisper의 전문용어 인식률이 크게 올라갑니다.
+
 | 이름 | 설명 |
 |---|---|
-| `dev` | 개발회의 (API, 프레임워크, DevOps 용어) |
+| `dev` | 개발회의 (프레임워크, DevOps, AI/클라우드 용어) |
+| `medical` | 의료/성형외과 (진료, 시술, 해부학 용어) |
 | `general` | 일반 (프롬프트 없음) |
+| `meeting` | 일반 회의 (아젠다, 액션아이템, 스크럼 용어) |
+| `interview` | 사용자/채용 인터뷰 (지원자, 역량, 페인포인트 용어) |
+| `finance` | 금융/회계 (매출, 재무제표, 밸류에이션 용어) |
 
 `presets/` 폴더에 새 `.txt` 파일을 추가하면 **자동으로 인식**됩니다.
 
 ```bash
-# 예: 의료 도메인 프리셋 추가
-echo "임플란트 보철 크라운 인레이 온레이 ..." > presets/medical.txt
+# 예: 법률 도메인 프리셋 추가
+echo "판례 소송 조항 계약 손해배상 의무 권리 갑 을 NDA MSA SOW" > presets/legal.txt
 ```
 
 ---

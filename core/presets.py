@@ -9,9 +9,12 @@ PRESETS_DIR = Path(__file__).parent.parent / "presets"
 
 # 내장 프리셋 목록
 BUILTIN_PRESETS = {
-    "dev": "개발회의 (API, 프레임워크, DevOps 용어)",
-    "medical": "의료/성형외과 (시술명, 해부학 용어)",
+    "dev": "개발회의 (프레임워크, DevOps, AI/클라우드 용어)",
+    "medical": "의료/성형외과 (진료, 시술, 해부학 용어)",
     "general": "일반 (프롬프트 없음)",
+    "meeting": "일반 회의 (아젠다, 액션아이템, 스크럼 용어)",
+    "interview": "사용자/채용 인터뷰 (지원자, 역량, 페인포인트 용어)",
+    "finance": "금융/회계 (매출, 재무제표, 밸류에이션 용어)",
 }
 
 
