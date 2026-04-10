@@ -3,12 +3,16 @@
 
 더블클릭으로 실행하면 브라우저에서 깔끔한 UI가 열립니다.
 오디오 파일을 1개 또는 여러 개 드래그앤드롭하고 '전사 시작' 버튼만 누르면 끝.
+
+엔진: whispermlx (WhisperX 의 Apple Silicon 포크) + mlx-whisper 백엔드
 """
 
+import shutil
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import gradio as gr
 
@@ -35,16 +39,16 @@ def _format_body(result, include_timestamps: bool) -> str:
     if include_timestamps and result.segments:
         lines = []
         for seg in result.segments:
-            start = _fmt_ts(seg["start"])
-            end = _fmt_ts(seg["end"])
-            text = seg["text"].strip()
+            start = _fmt_ts(float(seg.get("start", 0.0)))
+            end = _fmt_ts(float(seg.get("end", 0.0)))
+            text = (seg.get("text") or "").strip()
             lines.append(f"[{start} → {end}] {text}")
         return "\n".join(lines)
     return result.text
 
 
 def _normalize_files(audio_files) -> List[str]:
-    """gr.File의 입력을 항상 파일 경로 리스트로 정규화한다."""
+    """gr.File 의 입력을 항상 파일 경로 리스트로 정규화한다."""
     if audio_files is None:
         return []
     if isinstance(audio_files, (str, Path)):
@@ -52,7 +56,6 @@ def _normalize_files(audio_files) -> List[str]:
     if isinstance(audio_files, (list, tuple)):
         out = []
         for f in audio_files:
-            # gr.File은 dict 또는 NamedString을 줄 수 있음
             if isinstance(f, dict):
                 out.append(f.get("path") or f.get("name", ""))
             elif hasattr(f, "name"):
@@ -60,10 +63,45 @@ def _normalize_files(audio_files) -> List[str]:
             else:
                 out.append(str(f))
         return [p for p in out if p]
-    # 단일 객체
     if hasattr(audio_files, "name"):
         return [audio_files.name]
     return [str(audio_files)]
+
+
+def _probe_audio_duration(path: str) -> Optional[float]:
+    """ffprobe 로 오디오 길이(초)를 조회. 실패 시 None."""
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+        return float(out.strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        return None
+
+
+def _format_audio_length(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "?"
+    if seconds < 60:
+        return f"{seconds:.0f}초"
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    if m < 60:
+        return f"{m}분 {s}초"
+    h = int(m // 60)
+    m = m % 60
+    return f"{h}시간 {m}분"
 
 
 # ──────────────────────────────────────────────
@@ -81,7 +119,7 @@ def run_transcription(
     """오디오 파일 1개 또는 N개를 순차 전사한다.
 
     - 1개  → 단일 .txt 파일을 다운로드 슬롯에 제공
-    - N개  → 각 파일별 .txt를 만들어 transcripts.zip으로 묶어 제공
+    - N개  → 각 파일별 .txt 를 만들어 transcripts.zip 으로 묶어 제공
     """
 
     files = _normalize_files(audio_files)
@@ -99,7 +137,10 @@ def run_transcription(
             skipped.append(Path(fp).name)
 
     if skipped:
-        gr.Warning(f"지원하지 않는 형식 {len(skipped)}개 무시: {', '.join(skipped[:3])}{'...' if len(skipped) > 3 else ''}")
+        gr.Warning(
+            f"지원하지 않는 형식 {len(skipped)}개 무시: "
+            f"{', '.join(skipped[:3])}{'...' if len(skipped) > 3 else ''}"
+        )
 
     if not valid_files:
         return "", None, "❌ 지원하는 오디오 파일이 없습니다."
@@ -124,6 +165,11 @@ def run_transcription(
     }
     lang_code = lang_map.get(language, "ko")
 
+    # ── 전체 오디오 길이 사전 조회 (ffprobe) ──
+    # 상태 메시지에 "X분 오디오" 로 노출하여 대기 예측을 돕는다.
+    per_file_durations = [_probe_audio_duration(fp) for fp in valid_files]
+    total_known_duration = sum(d for d in per_file_durations if d is not None)
+
     # ── 배치 처리 ──
     n = len(valid_files)
     output_dir = Path(tempfile.mkdtemp(prefix="noma-scribe-"))
@@ -132,27 +178,55 @@ def run_transcription(
     success_count = 0
     total_elapsed = 0.0
 
-    progress(0.0, desc=f"준비 중... ({n}개 파일)")
+    progress(
+        0.0,
+        desc=(
+            f"준비 중... ({n}개 파일"
+            + (f", 총 {_format_audio_length(total_known_duration)}" if total_known_duration else "")
+            + ")"
+        ),
+    )
 
     for idx, fp in enumerate(valid_files, 1):
         audio_path = Path(fp)
+        file_dur = per_file_durations[idx - 1]
+        length_str = _format_audio_length(file_dur)
+        base_pct = (idx - 1) / n
+
+        # 파일 시작 시 progress 업데이트 (길이 힌트 포함)
         progress(
-            (idx - 1) / n,
-            desc=f"{idx}/{n} 전사 중... ({audio_path.name})",
+            base_pct,
+            desc=f"{idx}/{n} 전사 중... ({audio_path.name}, {length_str})",
         )
 
-        try:
-            options = {
-                "audio_path": str(audio_path),
-                "model": DEFAULT_MODEL,
-                "word_timestamps": include_timestamps,
-            }
-            if lang_code:
-                options["language"] = lang_code
-            if prompt:
-                options["initial_prompt"] = prompt
+        # whispermlx 가 VAD 청크 단위로 호출해주는 progress_callback.
+        # 청크 진행률(0~100)을 전체 진행률로 환산해서 Gradio Progress 에 반영한다.
+        def _make_cb(file_idx: int):
+            def _cb(pct: float):
+                try:
+                    chunk_fraction = max(0.0, min(1.0, pct / 100.0))
+                    overall = (file_idx - 1 + chunk_fraction) / n
+                    progress(
+                        overall,
+                        desc=(
+                            f"{file_idx}/{n} 전사 중... "
+                            f"({audio_path.name}, {length_str}) — {pct:.0f}%"
+                        ),
+                    )
+                except Exception:
+                    # progress 업데이트 실패는 전사를 멈추지 않는다
+                    pass
+            return _cb
 
-            result = transcribe(**options)
+        try:
+            result = transcribe(
+                audio_path=str(audio_path),
+                language=lang_code,
+                model=DEFAULT_MODEL,
+                initial_prompt=prompt,
+                word_timestamps=include_timestamps,
+                progress_callback=_make_cb(idx),
+            )
             total_elapsed += result.duration_seconds
             success_count += 1
 
@@ -218,7 +292,7 @@ def create_app():
         gr.Markdown("# 🎙️ noma-scribe", elem_classes=["main-title"])
         gr.Markdown(
             "오디오 파일을 1개 또는 여러 개 올리고 버튼만 누르면 텍스트로 전사합니다. "
-            "완전 로컬, 무료.",
+            "완전 로컬, 무료. (엔진: whispermlx + mlx-whisper)",
             elem_classes=["sub-title"],
         )
 
@@ -253,7 +327,7 @@ def create_app():
                         label="언어",
                     )
                     timestamps = gr.Checkbox(
-                        label="타임스탬프 포함",
+                        label="타임스탬프 포함 (세그먼트 단위)",
                         value=False,
                     )
 
@@ -305,7 +379,7 @@ def create_app():
 if __name__ == "__main__":
     app = create_app()
 
-    # Gradio 6.0+: theme/css는 launch()로 전달
+    # Gradio 6.0+: theme/css 는 launch() 로 전달
     theme = gr.themes.Soft(
         primary_hue="blue",
         neutral_hue="slate",
