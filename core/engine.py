@@ -26,6 +26,61 @@ from core.postprocess import clean_segments, clean_text
 
 
 # ──────────────────────────────────────────────
+# 모델 맵 (빠른 모드 / 정밀 모드)
+# ──────────────────────────────────────────────
+
+MODELS = {
+    "fast": "mlx-community/whisper-large-v3-turbo",
+    "precise": "mlx-community/whisper-large-v3-mlx",
+}
+
+
+# ──────────────────────────────────────────────
+# ffmpeg 구간 슬라이싱
+# ──────────────────────────────────────────────
+
+def slice_audio(
+    audio_path: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+) -> str:
+    """ffmpeg 로 오디오의 특정 구간을 잘라낸다.
+
+    Args:
+        audio_path: 원본 오디오 파일 경로
+        start_time: 시작 시간 (MM:SS 또는 HH:MM:SS). None 이면 처음부터.
+        end_time: 끝 시간 (MM:SS 또는 HH:MM:SS). None 이면 끝까지.
+
+    Returns:
+        잘려진 임시 파일 경로. 호출자가 정리 책임.
+        start_time 과 end_time 모두 None 이면 원본 경로 그대로 반환.
+    """
+    if not start_time and not end_time:
+        return audio_path
+
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg 가 설치되어 있지 않습니다.")
+
+    suffix = Path(audio_path).suffix or ".m4a"
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.close()
+
+    cmd = ["ffmpeg", "-y", "-i", str(audio_path)]
+    if start_time:
+        cmd += ["-ss", start_time]
+    if end_time:
+        cmd += ["-to", end_time]
+    cmd += ["-c", "copy", "-loglevel", "error", tmp.name]
+
+    subprocess.run(cmd, check=True, timeout=60)
+    return tmp.name
+
+
+# ──────────────────────────────────────────────
 # 설정
 # ──────────────────────────────────────────────
 
