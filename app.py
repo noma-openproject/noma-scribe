@@ -16,7 +16,7 @@ from typing import List, Optional
 
 import gradio as gr
 
-from core.engine import transcribe, save_result, DEFAULT_MODEL
+from core.engine import transcribe, save_result, align_words, DEFAULT_MODEL
 from core.presets import load_prompt, list_presets
 from core.utils import format_duration, SUPPORTED_EXTENSIONS
 
@@ -34,9 +34,35 @@ def _fmt_ts(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def _format_body(result, include_timestamps: bool) -> str:
-    """전사 결과를 화면 표시용 텍스트로 변환."""
-    if include_timestamps and result.segments:
+def _format_body(result, include_timestamps: bool, aligned_result: dict = None) -> str:
+    """전사 결과를 화면 표시용 텍스트로 변환.
+
+    aligned_result 가 있으면 단어 단위 타임스탬프를 사용한다.
+    """
+    if include_timestamps and aligned_result and aligned_result.get("segments"):
+        # word-level aligned 결과 사용
+        lines = []
+        for seg in aligned_result["segments"]:
+            seg_start = _fmt_ts(float(seg.get("start", 0.0)))
+            seg_end = _fmt_ts(float(seg.get("end", 0.0)))
+            words = seg.get("words", [])
+            if words:
+                word_parts = []
+                for w in words:
+                    word_text = w.get("word", "")
+                    if "start" in w and "end" in w:
+                        ws = _fmt_ts(float(w["start"]))
+                        we = _fmt_ts(float(w["end"]))
+                        word_parts.append(f"{word_text}({ws})")
+                    else:
+                        word_parts.append(word_text)
+                lines.append(f"[{seg_start} → {seg_end}] {' '.join(word_parts)}")
+            else:
+                text = (seg.get("text") or "").strip()
+                lines.append(f"[{seg_start} → {seg_end}] {text}")
+        return "\n".join(lines)
+    elif include_timestamps and result.segments:
+        # segment-level fallback
         lines = []
         for seg in result.segments:
             start = _fmt_ts(float(seg.get("start", 0.0)))
@@ -230,6 +256,18 @@ def run_transcription(
             total_elapsed += result.duration_seconds
             success_count += 1
 
+            # word-level alignment (타임스탬프 옵션 활성화 시)
+            aligned_result = None
+            if include_timestamps:
+                try:
+                    aligned_result = align_words(result)
+                except Exception as align_err:
+                    # alignment 실패해도 세그먼트 단위 타임스탬프로 fallback
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"word alignment 실패 (세그먼트 단위로 대체): {align_err}"
+                    )
+
             # 결과 저장
             txt_filename = audio_path.stem + ".txt"
             txt_path = output_dir / txt_filename
@@ -237,7 +275,7 @@ def run_transcription(
             txt_paths.append(txt_path)
 
             # 화면 표시 텍스트 누적
-            body = _format_body(result, include_timestamps)
+            body = _format_body(result, include_timestamps, aligned_result=aligned_result)
             if n == 1:
                 display_blocks.append(body)
             else:
@@ -327,7 +365,7 @@ def create_app():
                         label="언어",
                     )
                     timestamps = gr.Checkbox(
-                        label="타임스탬프 포함 (세그먼트 단위)",
+                        label="타임스탬프 포함 (단어 단위 정렬)",
                         value=False,
                     )
 
