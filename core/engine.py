@@ -26,13 +26,65 @@ from core.postprocess import clean_segments, clean_text
 
 
 # ──────────────────────────────────────────────
-# 모델 맵 (빠른 모드 / 정밀 모드)
+# 모델 맵
 # ──────────────────────────────────────────────
 
+# 프로젝트 루트 (engine.py 기준 한 단계 위)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 MODELS = {
-    "fast": "mlx-community/whisper-large-v3-turbo",
-    "precise": "mlx-community/whisper-large-v3-mlx",
+    "fast": {
+        "path": "mlx-community/whisper-large-v3-turbo",
+        "label": "⚡ 빠른 모드",
+        "desc": "다국어 범용, 한영 혼용에 적합",
+    },
+    "korean": {
+        "path": str(_PROJECT_ROOT / "models" / "ko-turbo"),
+        "label": "🇰🇷 한국어 모드",
+        "desc": "한국어 회의에 최적, 빠른 모드보다 빠르고 정확",
+    },
+    "precise": {
+        "path": "mlx-community/whisper-large-v3-mlx",
+        "label": "🔬 정밀 모드",
+        "desc": "최고 정확도, 2~3배 느림",
+    },
 }
+
+
+def resolve_model_path(mode: str) -> str:
+    """모드 키 → 실제 모델 경로.
+
+    로컬 경로이면 존재 여부를 확인하고, HF repo ID 이면 그대로 반환.
+    """
+    info = MODELS.get(mode, MODELS["fast"])
+    path = info["path"]
+    # 절대 경로 or "models/"로 시작 → 로컬
+    if path.startswith("/") or path.startswith("models"):
+        resolved = Path(path)
+        if not resolved.is_absolute():
+            resolved = _PROJECT_ROOT / resolved
+        if not resolved.exists():
+            raise FileNotFoundError(
+                f"로컬 모델을 찾을 수 없습니다: {resolved}\n"
+                f"한국어 모델을 설치하려면 README를 참조하세요."
+            )
+        return str(resolved)
+    # HF repo ID
+    return path
+
+
+def is_model_available(mode: str) -> bool:
+    """모델이 사용 가능한지 확인. 로컬 모델은 경로 존재 확인, HF는 항상 True."""
+    info = MODELS.get(mode)
+    if not info:
+        return False
+    path = info["path"]
+    if path.startswith("/") or path.startswith("models"):
+        resolved = Path(path)
+        if not resolved.is_absolute():
+            resolved = _PROJECT_ROOT / resolved
+        return resolved.exists()
+    return True
 
 
 # ──────────────────────────────────────────────
