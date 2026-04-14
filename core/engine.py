@@ -217,3 +217,123 @@ def _format_timestamp(seconds: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+# ──────────────────────────────────────────────
+# 단어 단위 정렬 (word_timestamps)
+# ──────────────────────────────────────────────
+#
+# whispermlx.align() 은 wav2vec2 기반 forced alignment 로
+# 세그먼트 → 단어별 start/end 타임스탬프를 생성한다.
+# 한국어: "kresnik/wav2vec2-large-xlsr-korean" 자동 선택.
+
+_ALIGN_MODEL_CACHE: Dict[str, tuple] = {}
+
+
+def align_words(
+    result: TranscribeResult,
+    device: str = "cpu",
+) -> dict:
+    """전사 결과에 단어 단위 타임스탬프를 부여한다.
+
+    Args:
+        result: transcribe() 가 반환한 TranscribeResult
+        device: torch 디바이스 ("cpu" 권장, MPS 는 wav2vec2 호환 이슈)
+
+    Returns:
+        whispermlx AlignedTranscriptionResult dict
+        {"segments": [...], "word_segments": [...]}
+    """
+    language = result.language or "ko"
+
+    # align 모델 캐시
+    if language not in _ALIGN_MODEL_CACHE:
+        model, metadata = whispermlx.load_align_model(
+            language_code=language,
+            device=device,
+        )
+        _ALIGN_MODEL_CACHE[language] = (model, metadata)
+    else:
+        model, metadata = _ALIGN_MODEL_CACHE[language]
+
+    aligned = whispermlx.align(
+        transcript=result.segments,
+        model=model,
+        align_model_metadata=metadata,
+        audio=result.audio_path,
+        device=device,
+    )
+
+    return aligned
+
+
+# ──────────────────────────────────────────────
+# 화자 분리 (diarize) — 조건부 활성화
+# ──────────────────────────────────────────────
+#
+# pyannote/speaker-diarization-community-1 은 gated model 이라
+# HuggingFace 토큰이 필요하다. 토큰이 없으면 graceful skip.
+# 현재 단계에서는 비활성화가 기본이다.
+
+def diarize(
+    audio_path: str,
+    hf_token: Optional[str] = None,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    device: str = "mps",
+) -> Optional["pd.DataFrame"]:
+    """화자 분리를 수행한다. HF 토큰이 없으면 None 반환.
+
+    Args:
+        audio_path: 오디오 파일 경로
+        hf_token: HuggingFace 토큰 (pyannote gated model 접근용)
+        min_speakers: 최소 화자 수 (None = 자동)
+        max_speakers: 최대 화자 수 (None = 자동)
+        device: torch 디바이스 ("mps" 권장 on Apple Silicon)
+
+    Returns:
+        화자 분리 DataFrame 또는 None (토큰 없거나 실패 시)
+    """
+    import os as _os
+
+    token = hf_token or _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+    if not token:
+        return None
+
+    try:
+        from whispermlx.diarize import DiarizationPipeline
+
+        pipeline = DiarizationPipeline(
+            token=token,
+            device=device,
+        )
+        diarize_df = pipeline(
+            audio_path,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
+        return diarize_df
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"화자 분리 실패 (무시): {e}")
+        return None
+
+
+def assign_speakers(
+    transcript_result: dict,
+    diarize_df,
+) -> dict:
+    """화자 분리 결과를 전사 결과에 매핑한다.
+
+    Args:
+        transcript_result: align_words() 또는 transcribe() 결과 dict
+        diarize_df: diarize() 가 반환한 DataFrame
+
+    Returns:
+        화자 라벨이 붙은 transcript_result
+    """
+    if diarize_df is None:
+        return transcript_result
+
+    return whispermlx.assign_word_speakers(diarize_df, transcript_result)
