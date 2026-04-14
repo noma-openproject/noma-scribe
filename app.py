@@ -22,6 +22,8 @@ from core.engine import (
     MODELS,
     DEFAULT_MODEL,
     align_words,
+    is_model_available,
+    resolve_model_path,
     save_result,
     slice_audio,
     transcribe,
@@ -148,6 +150,7 @@ def _parse_time(time_str: str) -> Optional[str]:
 def run_transcription(
     audio_files,
     mode: str,
+    two_pass_enabled: bool,
     output_format: str,
     start_time: str,
     end_time: str,
@@ -165,9 +168,20 @@ def run_transcription(
     if not valid_files:
         return "", None, "❌ 지원하는 오디오 파일이 없습니다.", ""
 
-    # 모드 → 모델
-    is_precise = "정밀" in mode
-    model = MODELS["precise"] if is_precise else MODELS["fast"]
+    # 모드 → 모델 키
+    if "한국어" in mode:
+        mode_key = "korean"
+    elif "정밀" in mode:
+        mode_key = "precise"
+    else:
+        mode_key = "fast"
+
+    try:
+        model = resolve_model_path(mode_key)
+    except FileNotFoundError as e:
+        return "", None, f"❌ {e}", ""
+
+    use_two_pass = two_pass_enabled
 
     # 언어
     lang_code = "ko"
@@ -195,7 +209,8 @@ def run_transcription(
         length_str = _format_audio_length(file_dur)
         base_pct = (idx - 1) / n
 
-        progress(base_pct, desc=f"{idx}/{n} {'정밀 ' if is_precise else ''}전사 중... ({audio_path.name}, {length_str})")
+        mode_label = MODELS[mode_key]["label"]
+        progress(base_pct, desc=f"{idx}/{n} [{mode_label}] 전사 중... ({audio_path.name}, {length_str})")
 
         # 구간 슬라이싱
         actual_path = str(audio_path)
@@ -217,11 +232,11 @@ def run_transcription(
             return _cb
 
         try:
-            if is_precise:
-                # 2-pass 전사
+            if use_two_pass:
+                # 2-pass 전사 (어떤 모드에서든)
                 def _status_cb(msg: str):
                     try:
-                        progress(base_pct, desc=f"{idx}/{n} {msg} ({audio_path.name})")
+                        progress(base_pct, desc=f"{idx}/{n} [{mode_label}] {msg} ({audio_path.name})")
                     except Exception:
                         pass
 
@@ -233,8 +248,7 @@ def run_transcription(
                     status_callback=_status_cb,
                 )
             else:
-                # 빠른 모드: 1-pass
-                progress(base_pct, desc=f"{idx}/{n} 전사 중... ({audio_path.name}, {length_str})")
+                # 1-pass
                 result = transcribe(
                     audio_path=actual_path,
                     language=lang_code,
@@ -319,11 +333,12 @@ def run_transcription(
         download_label = f"{zip_name} ({len(result_paths)}개)"
 
     elapsed_str = format_duration(total_elapsed)
-    mode_label = "정밀" if is_precise else "빠른"
+    status_mode = MODELS[mode_key]["label"]
+    two_pass_tag = " +2pass" if use_two_pass else ""
     if n == 1:
-        status = f"✅ 완료! [{mode_label}] ({elapsed_str}) — {download_label}"
+        status = f"✅ 완료! [{status_mode}{two_pass_tag}] ({elapsed_str}) — {download_label}"
     else:
-        status = f"✅ 완료! [{mode_label}] {success_count}/{n}개 ({elapsed_str}) — {download_label}"
+        status = f"✅ 완료! [{status_mode}{two_pass_tag}] {success_count}/{n}개 ({elapsed_str}) — {download_label}"
 
     return "\n\n".join(display_blocks), download_path, status, all_keywords_text
 
@@ -333,6 +348,23 @@ def run_transcription(
 # ──────────────────────────────────────────────
 
 def create_app():
+    # 모드 드롭다운 선택지 구성 (모델 존재 여부 반영)
+    mode_choices = []
+    default_mode = None
+    for key, info in MODELS.items():
+        available = is_model_available(key)
+        if available:
+            label = f"{info['label']} — {info['desc']}"
+            mode_choices.append(label)
+            if default_mode is None:
+                default_mode = label
+        else:
+            label = f"{info['label']} (모델 미설치)"
+            mode_choices.append(label)
+
+    if default_mode is None:
+        default_mode = mode_choices[0] if mode_choices else ""
+
     with gr.Blocks(title="noma-scribe") as app:
 
         gr.Markdown("# 🎙️ noma-scribe", elem_classes=["main-title"])
@@ -355,9 +387,13 @@ def create_app():
 
                 with gr.Accordion("옵션", open=False):
                     mode_select = gr.Dropdown(
-                        choices=["⚡ 빠른 모드 (large-v3-turbo)", "🔬 정밀 모드 (large-v3, 2-pass)"],
-                        value="⚡ 빠른 모드 (large-v3-turbo)",
+                        choices=mode_choices,
+                        value=default_mode,
                         label="전사 모드",
+                    )
+                    two_pass_check = gr.Checkbox(
+                        label="2-pass 용어 추출 (1차 전사 → 용어 자동 추출 → 2차 전사)",
+                        value=False,
                     )
                     format_select = gr.Dropdown(
                         choices=["텍스트 (.txt)", "타임스탬프 포함 (.txt)", "자막 (.srt)"],
@@ -407,7 +443,7 @@ def create_app():
 
         transcribe_btn.click(
             fn=run_transcription,
-            inputs=[audio_input, mode_select, format_select, start_time, end_time],
+            inputs=[audio_input, mode_select, two_pass_check, format_select, start_time, end_time],
             outputs=[output_text, download_file, status_text, keywords_text],
         )
 
