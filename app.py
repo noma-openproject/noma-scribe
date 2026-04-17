@@ -26,9 +26,11 @@ from core.engine import (
     slice_audio,
     transcribe,
 )
+from core.auto_glossary import detect_term_variants, format_cluster_preview
 from core.glossary import (
     DEFAULT_GLOSSARY_PATH,
     add_term,
+    apply_glossary,
     load_glossary,
     remove_term,
     save_glossary,
@@ -206,6 +208,78 @@ def ui_add_keyword_to_glossary(keyword: str) -> List[List[str]]:
 
 
 # ──────────────────────────────────────────────
+# v0.6.1: 자동 감지 클러스터 헬퍼
+# ──────────────────────────────────────────────
+
+def _detect_clusters(text: str) -> List[dict]:
+    """현재 용어집을 참고하여 용어 변형 클러스터 감지."""
+    if not text:
+        return []
+    current = load_glossary()
+    existing_canon = {t.get("canonical", "") for t in current.get("terms", [])}
+    existing_alias = set()
+    for t in current.get("terms", []):
+        for a in t.get("aliases", []) or []:
+            existing_alias.add(a)
+    try:
+        return detect_term_variants(
+            text,
+            min_frequency=2,
+            similarity_threshold=80,
+            existing_canonicals=existing_canon,
+            existing_aliases=existing_alias,
+        )
+    except Exception:
+        return []
+
+
+def ui_register_cluster(
+    idx: int,
+    clusters: List[dict],
+    current_text: str,
+) -> Tuple[List[dict], str]:
+    """클러스터 한 개를 용어집에 등록 + 현재 전사 텍스트에 즉시 재적용.
+
+    Returns: (새 클러스터 리스트, 업데이트된 전사 텍스트)
+    """
+    if idx < 0 or idx >= len(clusters):
+        gr.Warning("유효하지 않은 클러스터 인덱스")
+        return clusters, current_text
+
+    cluster = clusters[idx]
+    canonical = cluster["canonical"]
+    aliases = list(cluster.get("aliases", []))
+
+    try:
+        add_term(canonical, aliases)
+        gr.Info(f"'{canonical}' ← {aliases} 용어집 등록 완료")
+    except Exception as e:
+        gr.Warning(f"등록 실패: {e}")
+        return clusters, current_text
+
+    # 전사 결과에 즉시 재적용
+    updated_text = current_text
+    if current_text:
+        try:
+            updated_text = apply_glossary(current_text, load_glossary())
+        except Exception:
+            pass
+
+    # 해당 클러스터 제거
+    new_clusters = clusters[:idx] + clusters[idx + 1:]
+    return new_clusters, updated_text
+
+
+def ui_ignore_cluster(idx: int, clusters: List[dict]) -> List[dict]:
+    """클러스터를 숨김 (용어집에 추가 안 함, UI 에서만 제거)."""
+    if idx < 0 or idx >= len(clusters):
+        return clusters
+    new_clusters = clusters[:idx] + clusters[idx + 1:]
+    gr.Info(f"'{clusters[idx]['canonical']}' 무시됨")
+    return new_clusters
+
+
+# ──────────────────────────────────────────────
 # 핵심 로직 — 배치 전사
 # ──────────────────────────────────────────────
 
@@ -223,14 +297,14 @@ def run_transcription(
     files = _normalize_files(audio_files)
     if not files:
         gr.Warning("오디오 파일을 먼저 업로드해주세요.")
-        return "", None, "", [], _refresh_glossary_display()
+        return "", None, "", [], _refresh_glossary_display(), []
 
     valid_files = [fp for fp in files if Path(fp).suffix.lower() in SUPPORTED_EXTENSIONS]
     skipped = [Path(fp).name for fp in files if Path(fp).suffix.lower() not in SUPPORTED_EXTENSIONS]
     if skipped:
         gr.Warning(f"지원하지 않는 형식 {len(skipped)}개 무시")
     if not valid_files:
-        return "", None, "❌ 지원하는 오디오 파일이 없습니다.", [], _refresh_glossary_display()
+        return "", None, "❌ 지원하는 오디오 파일이 없습니다.", [], _refresh_glossary_display(), []
 
     # 모드 → 모델 키
     if "한국어" in mode:
@@ -243,7 +317,7 @@ def run_transcription(
     try:
         model = resolve_model_path(mode_key)
     except FileNotFoundError as e:
-        return "", None, f"❌ {e}", [], _refresh_glossary_display()
+        return "", None, f"❌ {e}", [], _refresh_glossary_display(), []
 
     use_two_pass = two_pass_enabled
     lang_code = "ko"
@@ -354,7 +428,7 @@ def run_transcription(
         except Exception as e:
             if n == 1:
                 progress(1.0, desc="실패")
-                return "", None, f"❌ {audio_path.name}: {e}", [], _refresh_glossary_display()
+                return "", None, f"❌ {audio_path.name}: {e}", [], _refresh_glossary_display(), []
             header = f"━━━ [{idx}/{n}] {audio_path.name} ━━━"
             display_blocks.append(f"{header}\n❌ 오류: {e}")
         finally:
@@ -367,7 +441,7 @@ def run_transcription(
     progress(1.0, desc="완료")
 
     if not result_paths:
-        return "\n\n".join(display_blocks), None, f"❌ 모두 실패 (0/{n})", keyword_rows, _refresh_glossary_display()
+        return "\n\n".join(display_blocks), None, f"❌ 모두 실패 (0/{n})", keyword_rows, _refresh_glossary_display(), []
 
     if len(result_paths) == 1:
         download_path = str(result_paths[0])
@@ -397,7 +471,15 @@ def run_transcription(
     else:
         status = f"✅ 완료! [{status_mode}{two_pass_tag}]{extras_tag} {success_count}/{n}개 ({elapsed_str}) — {download_label}"
 
-    return "\n\n".join(display_blocks), download_path, status, keyword_rows, _refresh_glossary_display()
+    # v0.6.1: 자동 감지 클러스터 계산
+    final_text = "\n\n".join(display_blocks)
+    flat_text = " ".join(
+        block.split("\n", 1)[-1] if "━━━" in block else block
+        for block in display_blocks
+    )
+    clusters = _detect_clusters(flat_text)
+
+    return final_text, download_path, status, keyword_rows, _refresh_glossary_display(), clusters
 
 
 # ──────────────────────────────────────────────
@@ -522,6 +604,47 @@ def create_app():
                             )
                             add_kw_btn = gr.Button("➕ 용어집 추가", scale=1)
 
+                        # ── v0.6.1: 자동 감지된 용어 변형 섹션 ──
+                        gr.Markdown("### 🔍 자동 감지된 용어 변형")
+                        gr.Markdown(
+                            "_전사 결과에서 서로 비슷한 단어(예: 프레모/프리모/프레머)를 자동으로 묶어 "
+                            "용어집 후보로 제안합니다. [등록] 누르면 즉시 반영되어 위 전사 결과가 업데이트됩니다._",
+                            elem_classes=["sub-title"],
+                        )
+                        clusters_state = gr.State(value=[])
+
+                        @gr.render(inputs=[clusters_state, output_text])
+                        def _render_clusters(clusters_value, current_text):
+                            if not clusters_value:
+                                gr.Markdown("_(자동 감지된 변형 없음 — 전사를 실행하면 여기에 후보가 나타납니다.)_")
+                                return
+                            for idx, cluster in enumerate(clusters_value):
+                                preview = format_cluster_preview(cluster)
+                                with gr.Row():
+                                    gr.Markdown(preview)
+                                    register_btn = gr.Button(
+                                        f"[등록]",
+                                        variant="primary",
+                                        size="sm",
+                                        scale=0,
+                                    )
+                                    ignore_btn = gr.Button(
+                                        f"[무시]",
+                                        size="sm",
+                                        scale=0,
+                                    )
+                                # closure 로 idx 고정
+                                register_btn.click(
+                                    fn=lambda clusters, text, i=idx: ui_register_cluster(i, clusters, text),
+                                    inputs=[clusters_state, output_text],
+                                    outputs=[clusters_state, output_text],
+                                )
+                                ignore_btn.click(
+                                    fn=lambda clusters, i=idx: ui_ignore_cluster(i, clusters),
+                                    inputs=[clusters_state],
+                                    outputs=[clusters_state],
+                                )
+
             # ════════════════════════════════════
             # Tab 2: 용어집 관리
             # ════════════════════════════════════
@@ -578,7 +701,7 @@ def create_app():
                 audio_input, mode_select, two_pass_check, format_select,
                 start_time_in, end_time_in, use_glossary_check, use_korean_norm_check,
             ],
-            outputs=[output_text, download_file, status_text, keywords_table, glossary_table],
+            outputs=[output_text, download_file, status_text, keywords_table, glossary_table, clusters_state],
         )
 
         add_kw_btn.click(
