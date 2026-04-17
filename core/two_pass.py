@@ -124,6 +124,9 @@ def two_pass_transcribe(
     model: str = "mlx-community/whisper-large-v3-turbo",
     progress_callback: Optional[Callable[[float], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
+    use_glossary: bool = True,
+    use_korean_norm: bool = True,
+    glossary: Optional[dict] = None,
 ) -> TranscribeResult:
     """2-pass 자동 용어 추출 전사.
 
@@ -133,6 +136,9 @@ def two_pass_transcribe(
         model: Whisper 모델
         progress_callback: 0~100 진행률 콜백
         status_callback: 상태 메시지 콜백 ("1차 전사 중..." 등)
+        use_glossary: 사용자 용어집 치환 여부
+        use_korean_norm: KSS 기반 한국어 정규화 여부
+        glossary: 용어집 dict (None 이면 기본 경로에서 로드)
 
     Returns:
         2차 전사 결과 (TranscribeResult)
@@ -158,6 +164,9 @@ def two_pass_transcribe(
         model=model,
         initial_prompt=None,
         progress_callback=_pass1_progress,
+        use_glossary=use_glossary,
+        use_korean_norm=use_korean_norm,
+        glossary=glossary,
     )
 
     # ── 용어 추출 ──
@@ -188,13 +197,13 @@ def two_pass_transcribe(
         model=model,
         initial_prompt=prompt,
         progress_callback=_pass2_progress,
+        use_glossary=use_glossary,
+        use_korean_norm=use_korean_norm,
+        glossary=glossary,
     )
 
     _status("후처리 중...")
     _progress(97)
-
-    # 2차 결과에 추출 용어 정보 첨부 (UI 표시용)
-    pass2_result.extracted_terms = terms  # type: ignore[attr-defined]
 
     _progress(100)
     _status("완료")

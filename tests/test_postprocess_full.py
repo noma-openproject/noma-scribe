@@ -16,6 +16,7 @@ from core.postprocess import (
     clean_segments,
     clean_text,
     full_postprocess,
+    postprocess_segments,
 )
 from core.glossary import add_term, load_glossary
 from core.korean_normalizer import is_available as kss_available
@@ -130,3 +131,25 @@ def test_full_postprocess_empty_glossary_no_crash():
         glossary={"terms": []},
     )
     assert "안녕하세요" in result
+
+
+def test_postprocess_segments_applies_glossary_without_paragraphs(tmp_path):
+    gp = tmp_path / "glossary.json"
+    add_term("Premo", ["프레모"], path=gp)
+    gloss = load_glossary(gp)
+
+    segs = [
+        {"start": 0.0, "end": 1.0, "text": "프레모가 좋다."},
+        {"start": 1.0, "end": 2.0, "text": "프레모를 쓴다."},
+    ]
+
+    out = postprocess_segments(
+        segs,
+        use_glossary=True,
+        use_korean_norm=False,
+        glossary=gloss,
+    )
+
+    assert out[0]["text"] == "Premo가 좋다."
+    assert out[1]["text"] == "Premo를 쓴다."
+    assert "\n\n" not in out[0]["text"]

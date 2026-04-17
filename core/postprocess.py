@@ -165,3 +165,32 @@ def full_postprocess(
             pass
 
     return out
+
+
+def postprocess_segments(
+    segments: List[dict],
+    use_glossary: bool = True,
+    use_korean_norm: bool = True,
+    glossary: "dict | None" = None,
+    fuzzy_threshold: int = 85,
+) -> List[dict]:
+    """세그먼트별 후처리를 적용한다.
+
+    타임스탬프 정합성 유지를 위해 문단 분리는 하지 않고, 각 세그먼트 텍스트에만
+    용어집/한국어 정규화를 적용한다.
+    """
+    processed: List[dict] = []
+    for seg in segments:
+        new_seg = dict(seg)
+        text = new_seg.get("text")
+        if isinstance(text, str):
+            new_seg["text"] = full_postprocess(
+                text,
+                use_glossary=use_glossary,
+                use_korean_norm=use_korean_norm,
+                glossary=glossary,
+                fuzzy_threshold=fuzzy_threshold,
+                paragraphs=False,
+            )
+        processed.append(new_seg)
+    return processed

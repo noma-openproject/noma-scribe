@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from core.engine import MODELS, save_result, slice_audio, transcribe
+from core.engine import resolve_model_path, save_result, slice_audio, transcribe
 from core.keywords import extract_keywords, format_keywords
 from core.srt import save_srt
 from core.two_pass import two_pass_transcribe
@@ -88,7 +88,12 @@ def main():
         args.format = "timestamps"
 
     # 모델 선택
-    model = MODELS["precise"] if args.precise else MODELS["fast"]
+    model_key = "precise" if args.precise else "fast"
+    try:
+        model = resolve_model_path(model_key)
+    except FileNotFoundError as e:
+        print(f"\n  ❌ {e}")
+        sys.exit(1)
     mode_label = "정밀" if args.precise else "빠른"
 
     # 오디오 파일 탐지
@@ -98,7 +103,7 @@ def main():
         print(f"\n  ❌ {e}")
         sys.exit(1)
 
-    print(f"\n  모드:   {mode_label} ({model.split('/')[-1]})")
+    print(f"\n  모드:   {mode_label} ({Path(model).name})")
     print(f"  언어:   {args.lang}")
     print(f"  포맷:   {args.format}")
     if args.start or args.end:
@@ -146,7 +151,7 @@ def main():
             if args.format == "srt":
                 output_path = build_output_path(audio_path, args.output)
                 output_path = output_path.with_suffix(".srt")
-                save_srt(result.segments, output_path)
+                save_srt(result.processed_segments or result.segments, output_path)
             else:
                 output_path = build_output_path(audio_path, args.output)
                 save_result(result, output_path,
