@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional
 import mlx_whisper  # whispermlx 의 백엔드이기도 함
 import whispermlx
 
-from core.postprocess import clean_segments, clean_text
+from core.postprocess import clean_segments, clean_text, full_postprocess
 
 
 # ──────────────────────────────────────────────
@@ -240,6 +240,10 @@ def transcribe(
     word_timestamps: bool = False,  # 현재 버전은 세그먼트 단위 타임스탬프만 제공
     verbose: bool = False,
     progress_callback: Optional[Callable[[float], None]] = None,
+    # v0.6 통합 후처리 옵션
+    use_glossary: bool = True,
+    use_korean_norm: bool = True,
+    glossary: Optional[dict] = None,
 ) -> TranscribeResult:
     """오디오 파일을 whispermlx 파이프라인으로 전사한다.
 
@@ -254,9 +258,14 @@ def transcribe(
         verbose: whispermlx 에 전달할 로깅 플래그
         progress_callback: 0~100 범위의 진행률을 받는 콜백 (whispermlx 가 VAD
             청크 단위로 호출). Gradio Progress 업데이트용.
+        use_glossary: 사용자 용어집 치환 여부 (v0.6). 기본 True.
+        use_korean_norm: KSS 기반 한국어 정규화 여부 (v0.6). 기본 True.
+        glossary: 용어집 dict (None 이면 DEFAULT_GLOSSARY_PATH 에서 로드)
 
     Returns:
-        후처리된 텍스트와 세그먼트가 담긴 TranscribeResult
+        후처리된 텍스트와 세그먼트가 담긴 TranscribeResult.
+        text 필드는 full_postprocess 파이프라인을 거치고,
+        segments 는 반복 환각만 정리된 세그먼트별 원본에 가까운 텍스트.
     """
     pipeline = _get_pipeline(model, language, initial_prompt)
 
@@ -275,8 +284,14 @@ def transcribe(
     # 원시 텍스트 = 세그먼트 텍스트를 공백으로 join
     raw_text = " ".join(seg.get("text", "").strip() for seg in segments).strip()
 
-    # 후처리 — 반복 환각 필터
-    cleaned_text = clean_text(raw_text)
+    # v0.6 통합 후처리: clean_hallucinations → glossary → KSS normalize/spacing → paragraphs
+    cleaned_text = full_postprocess(
+        raw_text,
+        use_glossary=use_glossary,
+        use_korean_norm=use_korean_norm,
+        glossary=glossary,
+    )
+    # 세그먼트는 타임스탬프 정합성을 위해 반복 환각만 정리 (용어집/문단 분리는 하지 않음)
     cleaned_segments = clean_segments(segments)
 
     return TranscribeResult(
