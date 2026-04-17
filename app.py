@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""noma-scribe v0.4: Apple Silicon 로컬 음성 전사 앱.
+"""noma-scribe v0.6: Apple Silicon 로컬 음성 전사 앱.
 
-주요 변경 (v0.4):
-- 프리셋 제거 → 빠른/정밀 모드 선택
-- 정밀 모드: 2-pass 자동 용어 추출
-- 출력 포맷: txt / 타임스탬프 txt / SRT 자막
-- 구간 전사: 시작/끝 시간 지정
-- 키워드 빈도 표시
+주요 변경 (v0.6):
+- 고급 옵션: 용어집 적용 / 한국어 문장 정리 체크박스
+- 용어집 관리 탭 (~/.noma-scribe/glossary.json)
+- 전사 후 키워드별 "용어집 추가" 기능 (Dataframe UI)
 """
 
 import shutil
@@ -14,7 +12,7 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import gradio as gr
 
@@ -28,14 +26,22 @@ from core.engine import (
     slice_audio,
     transcribe,
 )
+from core.glossary import (
+    DEFAULT_GLOSSARY_PATH,
+    add_term,
+    load_glossary,
+    remove_term,
+    save_glossary,
+)
 from core.keywords import extract_keywords, format_keywords
+from core.korean_normalizer import is_available as kss_available
 from core.srt import save_srt, segments_to_srt
 from core.two_pass import two_pass_transcribe
 from core.utils import format_duration, SUPPORTED_EXTENSIONS
 
 
 # ──────────────────────────────────────────────
-# 헬퍼
+# 헬퍼 (기존)
 # ──────────────────────────────────────────────
 
 def _fmt_ts(seconds: float) -> str:
@@ -95,7 +101,6 @@ def _format_audio_length(seconds: Optional[float]) -> str:
 
 
 def _format_body(result, output_format: str, aligned_result: dict = None) -> str:
-    """전사 결과를 화면 표시용 텍스트로 변환."""
     if output_format == "자막 (.srt)":
         return segments_to_srt(result.segments)
     elif output_format == "타임스탬프 포함 (.txt)":
@@ -118,7 +123,6 @@ def _format_body(result, output_format: str, aligned_result: dict = None) -> str
                     text = (seg.get("text") or "").strip()
                     lines.append(f"[{seg_start} → {seg_end}] {text}")
             return "\n".join(lines)
-        # fallback: segment-level
         lines = []
         for seg in result.segments:
             start = _fmt_ts(float(seg.get("start", 0.0)))
@@ -131,7 +135,6 @@ def _format_body(result, output_format: str, aligned_result: dict = None) -> str
 
 
 def _parse_time(time_str: str) -> Optional[str]:
-    """사용자 입력 MM:SS 또는 HH:MM:SS를 검증. 빈 문자열이면 None."""
     if not time_str or not time_str.strip():
         return None
     time_str = time_str.strip()
@@ -141,6 +144,65 @@ def _parse_time(time_str: str) -> Optional[str]:
     elif len(parts) == 3:
         return time_str
     return None
+
+
+# ──────────────────────────────────────────────
+# 용어집 UI 헬퍼 (v0.6)
+# ──────────────────────────────────────────────
+
+def _glossary_to_rows(data: dict) -> List[List[str]]:
+    """용어집 dict → Dataframe 행 [[canonical, aliases(쉼표)]]"""
+    rows = []
+    for t in data.get("terms", []):
+        canonical = t.get("canonical", "")
+        aliases = ", ".join(t.get("aliases", []) or [])
+        rows.append([canonical, aliases])
+    return rows
+
+
+def _refresh_glossary_display() -> List[List[str]]:
+    return _glossary_to_rows(load_glossary())
+
+
+def ui_add_glossary_term(canonical: str, aliases_str: str) -> Tuple[List[List[str]], str, str]:
+    canonical = (canonical or "").strip()
+    if not canonical:
+        gr.Warning("표준형(canonical)을 입력해주세요.")
+        return _refresh_glossary_display(), canonical, aliases_str
+
+    aliases = [a.strip() for a in (aliases_str or "").split(",") if a.strip()]
+    try:
+        add_term(canonical, aliases)
+        gr.Info(f"용어 추가: {canonical} ({len(aliases)}개 별칭)")
+    except Exception as e:
+        gr.Warning(f"용어 추가 실패: {e}")
+    return _refresh_glossary_display(), "", ""
+
+
+def ui_remove_glossary_term(canonical: str) -> Tuple[List[List[str]], str]:
+    canonical = (canonical or "").strip()
+    if not canonical:
+        gr.Warning("삭제할 표준형을 입력해주세요.")
+        return _refresh_glossary_display(), canonical
+    try:
+        remove_term(canonical)
+        gr.Info(f"용어 삭제: {canonical}")
+    except Exception as e:
+        gr.Warning(f"용어 삭제 실패: {e}")
+    return _refresh_glossary_display(), ""
+
+
+def ui_add_keyword_to_glossary(keyword: str) -> List[List[str]]:
+    keyword = (keyword or "").strip()
+    if not keyword:
+        gr.Warning("추가할 키워드를 입력해주세요.")
+    else:
+        try:
+            add_term(keyword, [])
+            gr.Info(f"'{keyword}' 용어집에 추가됨 (별칭은 용어집 관리 탭에서 추가)")
+        except Exception as e:
+            gr.Warning(f"용어집 추가 실패: {e}")
+    return _refresh_glossary_display()
 
 
 # ──────────────────────────────────────────────
@@ -154,19 +216,21 @@ def run_transcription(
     output_format: str,
     start_time: str,
     end_time: str,
+    use_glossary: bool,
+    use_korean_norm: bool,
     progress=gr.Progress(),
 ):
     files = _normalize_files(audio_files)
     if not files:
         gr.Warning("오디오 파일을 먼저 업로드해주세요.")
-        return "", None, "", ""
+        return "", None, "", [], _refresh_glossary_display()
 
     valid_files = [fp for fp in files if Path(fp).suffix.lower() in SUPPORTED_EXTENSIONS]
     skipped = [Path(fp).name for fp in files if Path(fp).suffix.lower() not in SUPPORTED_EXTENSIONS]
     if skipped:
         gr.Warning(f"지원하지 않는 형식 {len(skipped)}개 무시")
     if not valid_files:
-        return "", None, "❌ 지원하는 오디오 파일이 없습니다.", ""
+        return "", None, "❌ 지원하는 오디오 파일이 없습니다.", [], _refresh_glossary_display()
 
     # 모드 → 모델 키
     if "한국어" in mode:
@@ -179,25 +243,19 @@ def run_transcription(
     try:
         model = resolve_model_path(mode_key)
     except FileNotFoundError as e:
-        return "", None, f"❌ {e}", ""
+        return "", None, f"❌ {e}", [], _refresh_glossary_display()
 
     use_two_pass = two_pass_enabled
-
-    # 언어
     lang_code = "ko"
-
-    # 시간 범위
     t_start = _parse_time(start_time)
     t_end = _parse_time(end_time)
-
-    # 타임스탬프/SRT 여부
     needs_timestamps = output_format in ("타임스탬프 포함 (.txt)", "자막 (.srt)")
 
     n = len(valid_files)
     output_dir = Path(tempfile.mkdtemp(prefix="noma-scribe-"))
     result_paths: List[Path] = []
     display_blocks: List[str] = []
-    all_keywords_text = ""
+    keyword_rows: List[List] = []
     success_count = 0
     total_elapsed = 0.0
 
@@ -212,7 +270,6 @@ def run_transcription(
         mode_label = MODELS[mode_key]["label"]
         progress(base_pct, desc=f"{idx}/{n} [{mode_label}] 전사 중... ({audio_path.name}, {length_str})")
 
-        # 구간 슬라이싱
         actual_path = str(audio_path)
         sliced = False
         try:
@@ -233,7 +290,6 @@ def run_transcription(
 
         try:
             if use_two_pass:
-                # 2-pass 전사 (어떤 모드에서든)
                 def _status_cb(msg: str):
                     try:
                         progress(base_pct, desc=f"{idx}/{n} [{mode_label}] {msg} ({audio_path.name})")
@@ -248,28 +304,27 @@ def run_transcription(
                     status_callback=_status_cb,
                 )
             else:
-                # 1-pass
                 result = transcribe(
                     audio_path=actual_path,
                     language=lang_code,
                     model=model,
                     progress_callback=_make_cb(idx),
+                    use_glossary=use_glossary,
+                    use_korean_norm=use_korean_norm,
                 )
 
             total_elapsed += result.duration_seconds
             success_count += 1
 
-            # word alignment (타임스탬프 포맷 선택 시)
             aligned_result = None
             if needs_timestamps and output_format != "자막 (.srt)":
                 try:
                     aligned_result = align_words(result)
                 except Exception:
-                    pass  # fallback to segment-level
+                    pass
 
             progress(base_pct + 0.9 / n, desc=f"{idx}/{n} 후처리 중...")
 
-            # 결과 저장
             if output_format == "자막 (.srt)":
                 out_filename = audio_path.stem + ".srt"
                 out_path = output_dir / out_filename
@@ -281,7 +336,6 @@ def run_transcription(
                 save_result(result, out_path, include_timestamps=include_ts)
             result_paths.append(out_path)
 
-            # 화면 표시
             body = _format_body(result, output_format, aligned_result=aligned_result)
             if n == 1:
                 display_blocks.append(body)
@@ -289,24 +343,21 @@ def run_transcription(
                 header = f"━━━ [{idx}/{n}] {audio_path.name} ━━━"
                 display_blocks.append(f"{header}\n{body}")
 
-            # 키워드 빈도 (마지막 파일 또는 전체 텍스트)
             if idx == n:
                 full_text = " ".join(
                     block.split("\n", 1)[-1] if "━━━" in block else block
                     for block in display_blocks
                 )
                 kw = extract_keywords(full_text, top_n=15, min_count=2)
-                if kw:
-                    all_keywords_text = format_keywords(kw)
+                keyword_rows = [[w, c] for w, c in kw]
 
         except Exception as e:
             if n == 1:
                 progress(1.0, desc="실패")
-                return "", None, f"❌ {audio_path.name}: {e}", ""
+                return "", None, f"❌ {audio_path.name}: {e}", [], _refresh_glossary_display()
             header = f"━━━ [{idx}/{n}] {audio_path.name} ━━━"
             display_blocks.append(f"{header}\n❌ 오류: {e}")
         finally:
-            # 임시 슬라이스 파일 정리
             if sliced and Path(actual_path).exists():
                 try:
                     Path(actual_path).unlink()
@@ -316,9 +367,8 @@ def run_transcription(
     progress(1.0, desc="완료")
 
     if not result_paths:
-        return "\n\n".join(display_blocks), None, f"❌ 모두 실패 (0/{n})", all_keywords_text
+        return "\n\n".join(display_blocks), None, f"❌ 모두 실패 (0/{n})", keyword_rows, _refresh_glossary_display()
 
-    # 다운로드 파일
     if len(result_paths) == 1:
         download_path = str(result_paths[0])
         download_label = result_paths[0].name
@@ -335,12 +385,19 @@ def run_transcription(
     elapsed_str = format_duration(total_elapsed)
     status_mode = MODELS[mode_key]["label"]
     two_pass_tag = " +2pass" if use_two_pass else ""
-    if n == 1:
-        status = f"✅ 완료! [{status_mode}{two_pass_tag}] ({elapsed_str}) — {download_label}"
-    else:
-        status = f"✅ 완료! [{status_mode}{two_pass_tag}] {success_count}/{n}개 ({elapsed_str}) — {download_label}"
+    extras = []
+    if use_glossary:
+        extras.append("용어집")
+    if use_korean_norm:
+        extras.append("한글정리")
+    extras_tag = f" [{'/'.join(extras)}]" if extras else ""
 
-    return "\n\n".join(display_blocks), download_path, status, all_keywords_text
+    if n == 1:
+        status = f"✅ 완료! [{status_mode}{two_pass_tag}]{extras_tag} ({elapsed_str}) — {download_label}"
+    else:
+        status = f"✅ 완료! [{status_mode}{two_pass_tag}]{extras_tag} {success_count}/{n}개 ({elapsed_str}) — {download_label}"
+
+    return "\n\n".join(display_blocks), download_path, status, keyword_rows, _refresh_glossary_display()
 
 
 # ──────────────────────────────────────────────
@@ -348,7 +405,6 @@ def run_transcription(
 # ──────────────────────────────────────────────
 
 def create_app():
-    # 모드 드롭다운 선택지 구성 (모델 존재 여부 반영)
     mode_choices = []
     default_mode = None
     for key, info in MODELS.items():
@@ -369,82 +425,184 @@ def create_app():
 
         gr.Markdown("# 🎙️ noma-scribe", elem_classes=["main-title"])
         gr.Markdown(
-            "오디오 파일을 올리고 버튼만 누르면 텍스트로 전사합니다. "
-            "완전 로컬, 무료. (엔진: whispermlx)",
+            f"완전 로컬 음성 전사 · whispermlx + 용어집 + 한국어 정리 "
+            f"(KSS: {'✅' if kss_available() else '❌ 미설치'})",
             elem_classes=["sub-title"],
         )
 
-        with gr.Row():
-            # ── 왼쪽: 입력 ──
-            with gr.Column(scale=1):
-                audio_input = gr.File(
-                    label="오디오 파일 (여러 개 동시 업로드 가능)",
-                    file_count="multiple",
-                    file_types=[".mp3", ".m4a", ".wav", ".webm", ".ogg",
-                                ".flac", ".mp4", ".wma", ".aac"],
-                    type="filepath",
-                )
-
-                with gr.Accordion("옵션", open=False):
-                    mode_select = gr.Dropdown(
-                        choices=mode_choices,
-                        value=default_mode,
-                        label="전사 모드",
-                    )
-                    two_pass_check = gr.Checkbox(
-                        label="2-pass 용어 추출 (1차 전사 → 용어 자동 추출 → 2차 전사)",
-                        value=False,
-                    )
-                    format_select = gr.Dropdown(
-                        choices=["텍스트 (.txt)", "타임스탬프 포함 (.txt)", "자막 (.srt)"],
-                        value="텍스트 (.txt)",
-                        label="출력 포맷",
-                    )
-                    with gr.Row():
-                        start_time = gr.Textbox(
-                            label="시작 시간 (선택)",
-                            placeholder="MM:SS",
-                            max_lines=1,
-                        )
-                        end_time = gr.Textbox(
-                            label="끝 시간 (선택)",
-                            placeholder="MM:SS",
-                            max_lines=1,
+        with gr.Tabs():
+            # ════════════════════════════════════
+            # Tab 1: 전사
+            # ════════════════════════════════════
+            with gr.TabItem("🎙️ 전사"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        audio_input = gr.File(
+                            label="오디오 파일 (여러 개 동시 업로드 가능)",
+                            file_count="multiple",
+                            file_types=[".mp3", ".m4a", ".wav", ".webm", ".ogg",
+                                        ".flac", ".mp4", ".wma", ".aac"],
+                            type="filepath",
                         )
 
-                transcribe_btn = gr.Button(
-                    "🎙️ 전사 시작",
-                    variant="primary",
-                    size="lg",
+                        with gr.Accordion("옵션", open=False):
+                            mode_select = gr.Dropdown(
+                                choices=mode_choices,
+                                value=default_mode,
+                                label="전사 모드",
+                            )
+                            two_pass_check = gr.Checkbox(
+                                label="2-pass 용어 추출 (1차 전사 → 용어 자동 추출 → 2차 전사)",
+                                value=False,
+                            )
+                            format_select = gr.Dropdown(
+                                choices=["텍스트 (.txt)", "타임스탬프 포함 (.txt)", "자막 (.srt)"],
+                                value="텍스트 (.txt)",
+                                label="출력 포맷",
+                            )
+                            with gr.Row():
+                                start_time_in = gr.Textbox(
+                                    label="시작 시간 (선택)",
+                                    placeholder="MM:SS",
+                                    max_lines=1,
+                                )
+                                end_time_in = gr.Textbox(
+                                    label="끝 시간 (선택)",
+                                    placeholder="MM:SS",
+                                    max_lines=1,
+                                )
+
+                        with gr.Accordion("고급 옵션", open=False):
+                            use_glossary_check = gr.Checkbox(
+                                label="용어집 적용 (고유명사 자동 치환)",
+                                value=True,
+                            )
+                            use_korean_norm_check = gr.Checkbox(
+                                label="한국어 문장 정리 (KSS 띄어쓰기 + 문단 분리)",
+                                value=True,
+                            )
+
+                        transcribe_btn = gr.Button(
+                            "🎙️ 전사 시작",
+                            variant="primary",
+                            size="lg",
+                        )
+
+                    with gr.Column(scale=1):
+                        status_text = gr.Textbox(
+                            label="상태",
+                            interactive=False,
+                            elem_classes=["status-box"],
+                        )
+                        output_text = gr.Textbox(
+                            label="전사 결과",
+                            lines=18,
+                            max_lines=40,
+                            interactive=False,
+                        )
+                        download_file = gr.File(
+                            label="다운로드",
+                            visible=True,
+                        )
+
+                        gr.Markdown("### 📊 자주 등장한 단어 (Top 15)")
+                        keywords_table = gr.Dataframe(
+                            headers=["단어", "빈도"],
+                            datatype=["str", "number"],
+                            col_count=(2, "fixed"),
+                            row_count=(5, "dynamic"),
+                            interactive=False,
+                        )
+                        with gr.Row():
+                            selected_keyword = gr.Textbox(
+                                label="용어집에 추가할 단어",
+                                placeholder="위 표에서 단어를 복사해 입력",
+                                max_lines=1,
+                                scale=3,
+                            )
+                            add_kw_btn = gr.Button("➕ 용어집 추가", scale=1)
+
+            # ════════════════════════════════════
+            # Tab 2: 용어집 관리
+            # ════════════════════════════════════
+            with gr.TabItem("📚 용어집 관리"):
+                gr.Markdown(
+                    f"**저장 위치**: `{DEFAULT_GLOSSARY_PATH}`\n\n"
+                    "고유명사, 브랜드명, 전문용어의 **표준형(canonical)** 과 자주 오인식되는 "
+                    "**별칭(aliases)** 을 등록하면, 전사 결과가 자동으로 표준형으로 치환됩니다. "
+                    "별칭 외에도 RapidFuzz 유사도 85% 이상인 단어는 자동 치환됩니다."
                 )
 
-            # ── 오른쪽: 출력 ──
-            with gr.Column(scale=1):
-                status_text = gr.Textbox(
-                    label="상태",
+                glossary_table = gr.Dataframe(
+                    headers=["표준형 (canonical)", "별칭 (aliases, 쉼표 구분)"],
+                    datatype=["str", "str"],
+                    col_count=(2, "fixed"),
+                    row_count=(5, "dynamic"),
                     interactive=False,
-                    elem_classes=["status-box"],
-                )
-                output_text = gr.Textbox(
-                    label="전사 결과",
-                    lines=18,
-                    max_lines=40,
-                    interactive=False,
-                )
-                download_file = gr.File(
-                    label="다운로드",
-                    visible=True,
-                )
-                keywords_text = gr.Textbox(
-                    label="📊 자주 등장한 단어 (Top 15)",
-                    interactive=False,
-                    lines=2,
+                    value=_refresh_glossary_display(),
                 )
 
+                with gr.Row():
+                    refresh_btn = gr.Button("🔄 새로고침", scale=1)
+
+                gr.Markdown("### ➕ 용어 추가")
+                with gr.Row():
+                    new_canonical = gr.Textbox(
+                        label="표준형",
+                        placeholder="예: Premo",
+                        max_lines=1,
+                        scale=2,
+                    )
+                    new_aliases = gr.Textbox(
+                        label="별칭 (쉼표 구분)",
+                        placeholder="예: 프레모, 프리모, 프레머",
+                        max_lines=1,
+                        scale=3,
+                    )
+                    add_term_btn = gr.Button("추가", variant="primary", scale=1)
+
+                gr.Markdown("### 🗑️ 용어 삭제")
+                with gr.Row():
+                    remove_canonical = gr.Textbox(
+                        label="삭제할 표준형",
+                        placeholder="예: Premo",
+                        max_lines=1,
+                        scale=3,
+                    )
+                    remove_term_btn = gr.Button("삭제", variant="stop", scale=1)
+
+        # 이벤트
         transcribe_btn.click(
             fn=run_transcription,
-            inputs=[audio_input, mode_select, two_pass_check, format_select, start_time, end_time],
-            outputs=[output_text, download_file, status_text, keywords_text],
+            inputs=[
+                audio_input, mode_select, two_pass_check, format_select,
+                start_time_in, end_time_in, use_glossary_check, use_korean_norm_check,
+            ],
+            outputs=[output_text, download_file, status_text, keywords_table, glossary_table],
+        )
+
+        add_kw_btn.click(
+            fn=ui_add_keyword_to_glossary,
+            inputs=[selected_keyword],
+            outputs=[glossary_table],
+        )
+
+        add_term_btn.click(
+            fn=ui_add_glossary_term,
+            inputs=[new_canonical, new_aliases],
+            outputs=[glossary_table, new_canonical, new_aliases],
+        )
+
+        remove_term_btn.click(
+            fn=ui_remove_glossary_term,
+            inputs=[remove_canonical],
+            outputs=[glossary_table, remove_canonical],
+        )
+
+        refresh_btn.click(
+            fn=_refresh_glossary_display,
+            inputs=[],
+            outputs=[glossary_table],
         )
 
     return app

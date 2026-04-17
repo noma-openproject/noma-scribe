@@ -96,3 +96,72 @@ def clean_segments(segments: List[dict]) -> List[dict]:
             new_seg["text"] = clean_text(new_seg["text"])
         cleaned.append(new_seg)
     return cleaned
+
+
+# ──────────────────────────────────────────────
+# v0.6: 통합 후처리 파이프라인
+# ──────────────────────────────────────────────
+
+# clean_hallucinations 는 clean_text 의 명시적 이름 (기존 호환성 유지 + 의미 명확화)
+clean_hallucinations = clean_text
+
+
+def full_postprocess(
+    text: str,
+    use_glossary: bool = True,
+    use_korean_norm: bool = True,
+    glossary: "dict | None" = None,
+    fuzzy_threshold: int = 85,
+    paragraphs: bool = True,
+    sentences_per_paragraph: int = 4,
+) -> str:
+    """v0.6 통합 후처리 파이프라인.
+
+    순서:
+      1) clean_hallucinations (반복 환각 필터, 기존 로직)
+      2) apply_glossary (사용자 용어집 치환, use_glossary=True 일 때)
+      3) normalize_korean + fix_spacing (KSS 한국어 정규화, use_korean_norm=True 일 때)
+      4) split_into_paragraphs (3~5 문장 단위 문단, paragraphs=True 일 때)
+
+    Args:
+        text: 원본 전사 텍스트
+        use_glossary: 용어집 치환 적용 여부
+        use_korean_norm: KSS 한국어 정규화 적용 여부
+        glossary: 용어집 dict (None 이면 DEFAULT_GLOSSARY_PATH 에서 로드)
+        fuzzy_threshold: 용어집 유사도 임계치 (0-100)
+        paragraphs: 문단 분리 여부 (use_korean_norm=True 일 때만 동작)
+        sentences_per_paragraph: 문단당 문장 수
+
+    Returns:
+        후처리 완료된 텍스트
+    """
+    if not text:
+        return text
+
+    # 1) 반복 환각 제거 (기존)
+    out = clean_hallucinations(text)
+
+    # 2) 용어집 치환 (optional)
+    if use_glossary:
+        try:
+            from core.glossary import apply_glossary
+            out = apply_glossary(out, glossary=glossary, fuzzy_threshold=fuzzy_threshold)
+        except Exception:
+            # 용어집 로딩/치환 실패는 치명적이지 않음 — 직전 단계 결과 유지
+            pass
+
+    # 3) 한국어 정규화 + 띄어쓰기 교정 + 문단 (optional)
+    if use_korean_norm:
+        try:
+            from core.korean_normalizer import (
+                normalize_korean, fix_spacing, split_into_paragraphs,
+            )
+            out = normalize_korean(out)
+            out = fix_spacing(out)
+            if paragraphs:
+                out = split_into_paragraphs(out, sentences_per_paragraph)
+        except Exception:
+            # KSS 실패는 graceful — 직전 단계 결과 유지
+            pass
+
+    return out

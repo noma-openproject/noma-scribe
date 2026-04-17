@@ -1,2 +1,4 @@
 whispermlx>=3.12.0
 gradio>=5.0.0
+rapidfuzz>=3.0.0
+kss>=5.0.0
