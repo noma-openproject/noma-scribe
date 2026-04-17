@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional
 import mlx_whisper  # whispermlx 의 백엔드이기도 함
 import whispermlx
 
-from core.postprocess import clean_segments, clean_text, full_postprocess
+from core.postprocess import clean_segments, full_postprocess, postprocess_segments
 
 
 # ──────────────────────────────────────────────
@@ -154,7 +154,7 @@ DEFAULT_ASR_OPTIONS: Dict[str, Any] = {
 #
 # whispermlx/asr.py 의 MLXWhisperPipeline.transcribe 는 내부적으로
 # `mlx_whisper.transcribe(audio_chunk, path_or_hf_repo=..., language=..., task=...,
-#                          verbose=False, initial_prompt=..., word_timestamps=False)`
+#                          verbose=False, initial_prompt=...)`
 # 로 호출한다. 우리가 원하는 추가 옵션을 전달할 공식 경로가 없으므로,
 # `mlx_whisper.transcribe` 자체를 한 번 교체한다. whispermlx 가 명시적으로 넘기는
 # 인자(kwargs)가 우리 기본값을 override 하므로 side effect 는 없다.
@@ -190,6 +190,7 @@ class TranscribeResult:
     language: str
     duration_seconds: float  # 전사에 걸린 wall-clock 시간
     segments: List[dict] = field(default_factory=list)
+    processed_segments: List[dict] = field(default_factory=list)
     audio_path: str = ""
 
 
@@ -197,10 +198,11 @@ class TranscribeResult:
 # 모델 싱글턴 캐시
 # ──────────────────────────────────────────────
 #
-# VAD (silero) 모델 다운로드가 첫 호출에서 수초 걸리므로 (model, language) 쌍으로
-# 파이프라인을 캐시한다. 같은 프로세스 내에서 반복 전사 시 로드 비용을 없앤다.
+# VAD (silero) 모델 다운로드가 첫 호출에서 수초 걸리므로 prompt가 없는 기본
+# 파이프라인만 (model, language) 쌍으로 캐시한다. prompt별로 캐시하면 2-pass에서
+# 세션 메모리가 파일 수만큼 커질 수 있어 의도적으로 캐시하지 않는다.
 
-_PIPELINE_CACHE: Dict[tuple, Any] = {}
+_PIPELINE_CACHE: Dict[tuple[str, Optional[str]], Any] = {}
 
 
 def _get_pipeline(
@@ -208,10 +210,16 @@ def _get_pipeline(
     language: Optional[str],
     initial_prompt: Optional[str],
 ):
-    """whispermlx 파이프라인을 캐시 키(모델 + 언어 + 프롬프트)별로 반환."""
-    key = (model, language, initial_prompt or "")
-    if key in _PIPELINE_CACHE:
-        return _PIPELINE_CACHE[key]
+    """whispermlx 파이프라인을 반환한다.
+
+    prompt 없는 기본 전사 파이프라인만 재사용하고, prompt가 있는 경우는 매 호출마다
+    새 파이프라인을 만들어 메모리 사용량이 누적되지 않게 한다.
+    """
+    cache_key: Optional[tuple[str, Optional[str]]] = None
+    if not initial_prompt:
+        cache_key = (model, language)
+        if cache_key in _PIPELINE_CACHE:
+            return _PIPELINE_CACHE[cache_key]
 
     asr_options: Optional[Dict[str, Any]] = None
     if initial_prompt:
@@ -224,7 +232,8 @@ def _get_pipeline(
         asr_options=asr_options,
         vad_method="silero",      # pyannote 는 HF 토큰 필요, silero 는 공개
     )
-    _PIPELINE_CACHE[key] = pipeline
+    if cache_key is not None:
+        _PIPELINE_CACHE[cache_key] = pipeline
     return pipeline
 
 
@@ -237,7 +246,6 @@ def transcribe(
     language: str = "ko",
     model: str = DEFAULT_MODEL,
     initial_prompt: Optional[str] = None,
-    word_timestamps: bool = False,  # 현재 버전은 세그먼트 단위 타임스탬프만 제공
     verbose: bool = False,
     progress_callback: Optional[Callable[[float], None]] = None,
     # v0.6 통합 후처리 옵션
@@ -252,9 +260,6 @@ def transcribe(
         language: 전사 언어 코드 (기본 "ko"). None 이면 자동 감지.
         model: 모델 식별자 (short name 또는 HF repo ID)
         initial_prompt: 도메인 용어 힌트 — 전문용어 인식률 향상
-        word_timestamps: 호환성 유지용 플래그. whispermlx 는 내부적으로 False
-            로 호출하므로 현재는 효과 없음. UI 의 "타임스탬프 포함" 옵션은
-            세그먼트 단위 start/end 를 그대로 사용한다.
         verbose: whispermlx 에 전달할 로깅 플래그
         progress_callback: 0~100 범위의 진행률을 받는 콜백 (whispermlx 가 VAD
             청크 단위로 호출). Gradio Progress 업데이트용.
@@ -265,7 +270,8 @@ def transcribe(
     Returns:
         후처리된 텍스트와 세그먼트가 담긴 TranscribeResult.
         text 필드는 full_postprocess 파이프라인을 거치고,
-        segments 는 반복 환각만 정리된 세그먼트별 원본에 가까운 텍스트.
+        segments 는 정렬/타이밍용으로 반복 환각만 정리한 세그먼트,
+        processed_segments 는 export용으로 문단 분리 없이 동일한 후처리를 적용한 세그먼트다.
     """
     pipeline = _get_pipeline(model, language, initial_prompt)
 
@@ -291,14 +297,22 @@ def transcribe(
         use_korean_norm=use_korean_norm,
         glossary=glossary,
     )
-    # 세그먼트는 타임스탬프 정합성을 위해 반복 환각만 정리 (용어집/문단 분리는 하지 않음)
+    # align/word timestamp 는 원문과 가까운 세그먼트가 더 안전하므로 최소 정리본을 유지한다.
     cleaned_segments = clean_segments(segments)
+    # export/timestamp/SRT 는 일반 텍스트 결과와 최대한 동일한 후처리를 따르도록 별도 보관한다.
+    processed_segments = postprocess_segments(
+        segments,
+        use_glossary=use_glossary,
+        use_korean_norm=use_korean_norm,
+        glossary=glossary,
+    )
 
     return TranscribeResult(
         text=cleaned_text,
         language=detected_language,
         duration_seconds=elapsed,
         segments=cleaned_segments,
+        processed_segments=processed_segments,
         audio_path=str(audio_path),
     )
 
@@ -321,8 +335,9 @@ def save_result(
     """
     output_path = Path(output_path)
     with open(output_path, "w", encoding="utf-8") as f:
-        if include_timestamps and result.segments:
-            for seg in result.segments:
+        segments = result.processed_segments or result.segments
+        if include_timestamps and segments:
+            for seg in segments:
                 start = _format_timestamp(float(seg.get("start", 0.0)))
                 end = _format_timestamp(float(seg.get("end", 0.0)))
                 text = (seg.get("text") or "").strip()
@@ -342,7 +357,7 @@ def _format_timestamp(seconds: float) -> str:
 
 
 # ──────────────────────────────────────────────
-# 단어 단위 정렬 (word_timestamps)
+# 단어 단위 정렬
 # ──────────────────────────────────────────────
 #
 # whispermlx.align() 은 wav2vec2 기반 forced alignment 로
@@ -387,75 +402,3 @@ def align_words(
     )
 
     return aligned
-
-
-# ──────────────────────────────────────────────
-# 화자 분리 (diarize) — 조건부 활성화
-# ──────────────────────────────────────────────
-#
-# pyannote/speaker-diarization-community-1 은 gated model 이라
-# HuggingFace 토큰이 필요하다. 토큰이 없으면 graceful skip.
-# 현재 단계에서는 비활성화가 기본이다.
-
-def diarize(
-    audio_path: str,
-    hf_token: Optional[str] = None,
-    min_speakers: Optional[int] = None,
-    max_speakers: Optional[int] = None,
-    device: str = "mps",
-) -> Optional["pd.DataFrame"]:
-    """화자 분리를 수행한다. HF 토큰이 없으면 None 반환.
-
-    Args:
-        audio_path: 오디오 파일 경로
-        hf_token: HuggingFace 토큰 (pyannote gated model 접근용)
-        min_speakers: 최소 화자 수 (None = 자동)
-        max_speakers: 최대 화자 수 (None = 자동)
-        device: torch 디바이스 ("mps" 권장 on Apple Silicon)
-
-    Returns:
-        화자 분리 DataFrame 또는 None (토큰 없거나 실패 시)
-    """
-    import os as _os
-
-    token = hf_token or _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGINGFACE_HUB_TOKEN")
-
-    if not token:
-        return None
-
-    try:
-        from whispermlx.diarize import DiarizationPipeline
-
-        pipeline = DiarizationPipeline(
-            token=token,
-            device=device,
-        )
-        diarize_df = pipeline(
-            audio_path,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-        )
-        return diarize_df
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"화자 분리 실패 (무시): {e}")
-        return None
-
-
-def assign_speakers(
-    transcript_result: dict,
-    diarize_df,
-) -> dict:
-    """화자 분리 결과를 전사 결과에 매핑한다.
-
-    Args:
-        transcript_result: align_words() 또는 transcribe() 결과 dict
-        diarize_df: diarize() 가 반환한 DataFrame
-
-    Returns:
-        화자 라벨이 붙은 transcript_result
-    """
-    if diarize_df is None:
-        return transcript_result
-
-    return whispermlx.assign_word_speakers(diarize_df, transcript_result)
