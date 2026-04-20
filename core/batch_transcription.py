@@ -9,11 +9,14 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import time
+import traceback
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from core.diagnostics import RunDiagnostics, format_stage_timings
 from core.engine import MODELS, align_words, resolve_model_path, save_result, slice_audio, transcribe
 from core.keywords import extract_keywords
 from core.srt import save_srt, segments_to_srt
@@ -30,6 +33,7 @@ class BatchTranscriptionOptions:
     end_time: str = ""
     use_glossary: bool = True
     use_korean_norm: bool = True
+    debug_mode: bool = False
 
 
 @dataclass
@@ -40,6 +44,7 @@ class BatchTranscriptionResult:
     keyword_rows: List[List]
     clusters: List[dict]
     warnings: List[str] = field(default_factory=list)
+    log_path: Optional[str] = None
 
 
 def _fmt_ts(seconds: float) -> str:
@@ -172,9 +177,11 @@ def transcribe_batch(
     warning_callback: Optional[Callable[[str], None]] = None,
 ) -> BatchTranscriptionResult:
     warnings: List[str] = []
+    diagnostics = RunDiagnostics(origin="ui", debug=options.debug_mode)
 
     def warn(message: str) -> None:
         warnings.append(message)
+        diagnostics.note(f"warn {message}")
         if warning_callback:
             warning_callback(message)
 
@@ -185,24 +192,34 @@ def transcribe_batch(
     files = normalize_files(audio_files)
     if not files:
         warn("오디오 파일을 먼저 업로드해주세요.")
-        return BatchTranscriptionResult("", None, "", [], [], warnings=warnings)
+        return BatchTranscriptionResult("", None, "", [], [], warnings=warnings, log_path=str(diagnostics.log_path))
 
     valid_files = [fp for fp in files if Path(fp).suffix.lower() in SUPPORTED_EXTENSIONS]
     skipped = [Path(fp).name for fp in files if Path(fp).suffix.lower() not in SUPPORTED_EXTENSIONS]
     if skipped:
         warn(f"지원하지 않는 형식 {len(skipped)}개 무시")
     if not valid_files:
-        return BatchTranscriptionResult("", None, "❌ 지원하는 오디오 파일이 없습니다.", [], [], warnings=warnings)
+        return BatchTranscriptionResult(
+            "",
+            None,
+            "❌ 지원하는 오디오 파일이 없습니다.",
+            [],
+            [],
+            warnings=warnings,
+            log_path=str(diagnostics.log_path),
+        )
 
     mode_key = mode_label_to_key(options.mode_label)
     try:
         model = resolve_model_path(mode_key)
     except FileNotFoundError as e:
-        return BatchTranscriptionResult("", None, f"❌ {e}", [], [], warnings=warnings)
+        diagnostics.exception("resolve_model", str(e))
+        return BatchTranscriptionResult("", None, f"❌ {e}", [], [], warnings=warnings, log_path=str(diagnostics.log_path))
 
     t_start = parse_time(options.start_time)
     t_end = parse_time(options.end_time)
     needs_timestamps = options.output_format in ("타임스탬프 포함 (.txt)", "자막 (.srt)")
+    build_processed_segments = options.output_format != "텍스트 (.txt)"
 
     n = len(valid_files)
     output_dir = Path(tempfile.mkdtemp(prefix="noma-scribe-"))
@@ -213,6 +230,11 @@ def transcribe_batch(
     total_elapsed = 0.0
 
     update_progress(0.0, "준비 중...")
+    diagnostics.note(
+        f"run.config files={n} mode={mode_key} two_pass={options.two_pass_enabled} "
+        f"format={options.output_format} glossary={options.use_glossary} "
+        f"korean_norm={options.use_korean_norm}"
+    )
 
     for idx, fp in enumerate(valid_files, 1):
         audio_path = Path(fp)
@@ -220,6 +242,7 @@ def transcribe_batch(
         length_str = _format_audio_length(file_dur)
         base_pct = (idx - 1) / n
         mode_ui_label = MODELS[mode_key]["label"]
+        diagnostics.note(f"file.start name={audio_path.name} size={audio_path.stat().st_size}")
 
         update_progress(base_pct, f"{idx}/{n} [{mode_ui_label}] 전사 중... ({audio_path.name}, {length_str})")
 
@@ -227,44 +250,62 @@ def transcribe_batch(
         sliced = False
         try:
             if t_start or t_end:
+                slice_start = time.time()
                 actual_path = slice_audio(str(audio_path), t_start, t_end)
                 sliced = actual_path != str(audio_path)
+                diagnostics.stage(f"{audio_path.name}.slice_audio", time.time() - slice_start)
         except Exception as e:
             warn(f"구간 자르기 실패: {e}")
 
-        def _make_cb(file_idx: int):
-            def _cb(pct: float):
-                overall = (file_idx - 1 + max(0, min(1, pct / 100))) / n
-                update_progress(overall, f"{file_idx}/{n} 전사 중... ({audio_path.name}) — {pct:.0f}%")
+        progress_state = {"pct": 0.0, "stage": "전사 중..."}
 
-            return _cb
+        def _status_cb(message: str) -> None:
+            progress_state["stage"] = message
+            overall = (idx - 1 + min(0.96, progress_state["pct"] / 100 * 0.96)) / n
+            update_progress(
+                overall,
+                f"{idx}/{n} [{mode_ui_label}] {message} ({audio_path.name}) — {progress_state['pct']:.0f}%",
+            )
+
+        def _progress_cb(pct: float) -> None:
+            progress_state["pct"] = max(0.0, min(100.0, pct))
+            overall = (idx - 1 + min(0.96, progress_state["pct"] / 100 * 0.96)) / n
+            update_progress(
+                overall,
+                f"{idx}/{n} [{mode_ui_label}] {progress_state['stage']} ({audio_path.name}) — {progress_state['pct']:.0f}%",
+            )
 
         try:
             if options.two_pass_enabled:
-                def _status_cb(message: str) -> None:
-                    update_progress(base_pct, f"{idx}/{n} [{mode_ui_label}] {message} ({audio_path.name})")
-
                 result = two_pass_transcribe(
                     audio_path=actual_path,
                     language="ko",
                     model=model,
-                    progress_callback=_make_cb(idx),
+                    progress_callback=_progress_cb,
                     status_callback=_status_cb,
+                    warning_callback=warn,
                     use_glossary=options.use_glossary,
                     use_korean_norm=options.use_korean_norm,
+                    build_processed_segments=build_processed_segments,
+                    debug=options.debug_mode,
                 )
             else:
                 result = transcribe(
                     audio_path=actual_path,
                     language="ko",
                     model=model,
-                    progress_callback=_make_cb(idx),
+                    progress_callback=_progress_cb,
+                    status_callback=_status_cb,
+                    warning_callback=warn,
                     use_glossary=options.use_glossary,
                     use_korean_norm=options.use_korean_norm,
+                    build_processed_segments=build_processed_segments,
+                    debug=options.debug_mode,
                 )
 
             total_elapsed += result.duration_seconds
             success_count += 1
+            diagnostics.stage_map(audio_path.name, result.stage_timings)
 
             aligned_result = None
             if needs_timestamps and options.output_format != "자막 (.srt)" and not (
@@ -275,8 +316,9 @@ def transcribe_batch(
                 except Exception:
                     aligned_result = None
 
-            update_progress(base_pct + 0.9 / n, f"{idx}/{n} 후처리 중...")
+            update_progress((idx - 1 + 0.97) / n, f"{idx}/{n} [{mode_ui_label}] 결과 저장 중... ({audio_path.name})")
 
+            save_start = time.time()
             if options.output_format == "자막 (.srt)":
                 out_path = output_dir / f"{audio_path.stem}.srt"
                 save_srt(result.processed_segments or result.segments, out_path)
@@ -287,6 +329,7 @@ def transcribe_batch(
                     out_path,
                     include_timestamps=options.output_format == "타임스탬프 포함 (.txt)",
                 )
+            diagnostics.stage(f"{audio_path.name}.save_result", time.time() - save_start)
             result_paths.append(out_path)
 
             body = _format_body(result, options.output_format, aligned_result=aligned_result)
@@ -296,22 +339,31 @@ def transcribe_batch(
                 display_blocks.append(f"━━━ [{idx}/{n}] {audio_path.name} ━━━\n{body}")
 
             if idx == n:
+                update_progress((idx - 1 + 0.99) / n, f"{idx}/{n} [{mode_ui_label}] 키워드 정리 중... ({audio_path.name})")
+                keyword_start = time.time()
                 full_text = " ".join(
                     block.split("\n", 1)[-1] if "━━━" in block else block
                     for block in display_blocks
                 )
                 kw = extract_keywords(full_text, top_n=15, min_count=2)
                 keyword_rows = [[word, count] for word, count in kw]
+                diagnostics.stage(f"{audio_path.name}.extract_keywords", time.time() - keyword_start)
         except Exception as e:
+            tb = traceback.format_exc()
+            diagnostics.exception(audio_path.name, str(e), tb)
             if n == 1:
                 update_progress(1.0, "실패")
+                detail = f"❌ {audio_path.name}: {e}"
+                if options.debug_mode:
+                    detail = f"{detail}\n\n{tb.rstrip()}"
                 return BatchTranscriptionResult(
                     "",
                     None,
-                    f"❌ {audio_path.name}: {e}",
+                    detail,
                     [],
                     [],
                     warnings=warnings,
+                    log_path=str(diagnostics.log_path),
                 )
             display_blocks.append(f"━━━ [{idx}/{n}] {audio_path.name} ━━━\n❌ 오류: {e}")
         finally:
@@ -331,6 +383,7 @@ def transcribe_batch(
             keyword_rows,
             [],
             warnings=warnings,
+            log_path=str(diagnostics.log_path),
         )
 
     if len(result_paths) == 1:
@@ -356,10 +409,17 @@ def transcribe_batch(
         extras.append("한글정리")
     extras_tag = f" [{'/'.join(extras)}]" if extras else ""
 
+    stage_summary = ""
+    if n == 1 and success_count == 1:
+        stage_summary = format_stage_timings(result.stage_timings)
+
     if n == 1:
         status = f"✅ 완료! [{status_mode}{two_pass_tag}]{extras_tag} ({elapsed_str}) — {download_label}"
+        if stage_summary:
+            status += f"\n\n단계별 소요:\n{stage_summary}"
     else:
         status = f"✅ 완료! [{status_mode}{two_pass_tag}]{extras_tag} {success_count}/{n}개 ({elapsed_str}) — {download_label}"
+    status += f"\n\n로그: {diagnostics.log_path}"
 
     final_text = "\n\n".join(display_blocks)
     flat_text = " ".join(
@@ -375,4 +435,5 @@ def transcribe_batch(
         keyword_rows=keyword_rows,
         clusters=clusters,
         warnings=warnings,
+        log_path=str(diagnostics.log_path),
     )

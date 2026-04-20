@@ -11,7 +11,7 @@ engine.transcribe() 에서 자동으로 호출된다.
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import Callable, List, Optional
 
 
 # ──────────────────────────────────────────────
@@ -114,6 +114,9 @@ def full_postprocess(
     fuzzy_threshold: int = 85,
     paragraphs: bool = True,
     sentences_per_paragraph: int = 4,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    warning_callback: Optional[Callable[[str], None]] = None,
+    debug: bool = False,
 ) -> str:
     """v0.6 통합 후처리 파이프라인.
 
@@ -138,17 +141,26 @@ def full_postprocess(
     if not text:
         return text
 
+    def _progress(pct: float, message: str) -> None:
+        if progress_callback:
+            progress_callback(pct, message)
+
     # 1) 반복 환각 제거 (기존)
+    _progress(10, "반복 패턴 정리 중...")
     out = clean_hallucinations(text)
 
     # 2) 용어집 치환 (optional)
     if use_glossary:
+        _progress(30, "용어집 적용 중...")
         try:
             from core.glossary import apply_glossary
             out = apply_glossary(out, glossary=glossary, fuzzy_threshold=fuzzy_threshold)
-        except Exception:
+        except Exception as exc:
             # 용어집 로딩/치환 실패는 치명적이지 않음 — 직전 단계 결과 유지
-            pass
+            if debug:
+                raise RuntimeError(f"용어집 적용 실패: {exc}") from exc
+            if warning_callback:
+                warning_callback(f"용어집 적용 실패: {exc}")
 
     # 3) 한국어 정규화 + 띄어쓰기 교정 + 문단 (optional)
     if use_korean_norm:
@@ -156,14 +168,25 @@ def full_postprocess(
             from core.korean_normalizer import (
                 normalize_korean, fix_spacing, split_into_paragraphs,
             )
+            _progress(45, "한국어 정리 중...")
             out = normalize_korean(out)
-            out = fix_spacing(out)
+            _progress(55, "띄어쓰기 교정 중...")
+            out = fix_spacing(
+                out,
+                progress_callback=lambda pct: _progress(55 + pct * 0.30, "띄어쓰기 교정 중..."),
+                debug=debug,
+            )
             if paragraphs:
+                _progress(90, "문단 정리 중...")
                 out = split_into_paragraphs(out, sentences_per_paragraph)
-        except Exception:
+        except Exception as exc:
             # KSS 실패는 graceful — 직전 단계 결과 유지
-            pass
+            if debug:
+                raise RuntimeError(f"한국어 정리 실패: {exc}") from exc
+            if warning_callback:
+                warning_callback(f"한국어 정리 실패: {exc}")
 
+    _progress(100, "텍스트 정리 완료")
     return out
 
 
@@ -173,6 +196,9 @@ def postprocess_segments(
     use_korean_norm: bool = True,
     glossary: "dict | None" = None,
     fuzzy_threshold: int = 85,
+    progress_callback: Optional[Callable[[float], None]] = None,
+    warning_callback: Optional[Callable[[str], None]] = None,
+    debug: bool = False,
 ) -> List[dict]:
     """세그먼트별 후처리를 적용한다.
 
@@ -180,7 +206,8 @@ def postprocess_segments(
     용어집/한국어 정규화를 적용한다.
     """
     processed: List[dict] = []
-    for seg in segments:
+    total = len(segments) or 1
+    for idx, seg in enumerate(segments, 1):
         new_seg = dict(seg)
         text = new_seg.get("text")
         if isinstance(text, str):
@@ -191,6 +218,10 @@ def postprocess_segments(
                 glossary=glossary,
                 fuzzy_threshold=fuzzy_threshold,
                 paragraphs=False,
+                warning_callback=warning_callback,
+                debug=debug,
             )
         processed.append(new_seg)
+        if progress_callback:
+            progress_callback(idx / total * 100.0)
     return processed

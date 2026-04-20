@@ -192,6 +192,7 @@ class TranscribeResult:
     segments: List[dict] = field(default_factory=list)
     processed_segments: List[dict] = field(default_factory=list)
     audio_path: str = ""
+    stage_timings: Dict[str, float] = field(default_factory=dict)
 
 
 # ──────────────────────────────────────────────
@@ -248,10 +249,14 @@ def transcribe(
     initial_prompt: Optional[str] = None,
     verbose: bool = False,
     progress_callback: Optional[Callable[[float], None]] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    warning_callback: Optional[Callable[[str], None]] = None,
     # v0.6 통합 후처리 옵션
     use_glossary: bool = True,
     use_korean_norm: bool = True,
     glossary: Optional[dict] = None,
+    build_processed_segments: bool = True,
+    debug: bool = False,
 ) -> TranscribeResult:
     """오디오 파일을 whispermlx 파이프라인으로 전사한다.
 
@@ -261,11 +266,17 @@ def transcribe(
         model: 모델 식별자 (short name 또는 HF repo ID)
         initial_prompt: 도메인 용어 힌트 — 전문용어 인식률 향상
         verbose: whispermlx 에 전달할 로깅 플래그
-        progress_callback: 0~100 범위의 진행률을 받는 콜백 (whispermlx 가 VAD
-            청크 단위로 호출). Gradio Progress 업데이트용.
+        progress_callback: 0~100 범위의 진행률을 받는 콜백. 전사와 후처리를
+            모두 포함한 전체 진행률을 전달한다.
+        status_callback: 현재 단계 메시지를 받는 콜백.
+        warning_callback: 경고 메시지를 받는 콜백.
         use_glossary: 사용자 용어집 치환 여부 (v0.6). 기본 True.
         use_korean_norm: KSS 기반 한국어 정규화 여부 (v0.6). 기본 True.
         glossary: 용어집 dict (None 이면 DEFAULT_GLOSSARY_PATH 에서 로드)
+        build_processed_segments: export용 세그먼트 후처리 여부. 일반 텍스트
+            출력처럼 세그먼트를 쓰지 않는 경로에서는 False 로 두어 후처리
+            비용을 줄일 수 있다.
+        debug: True 이면 후처리 내부 예외를 숨기지 않고 상위로 전달한다.
 
     Returns:
         후처리된 텍스트와 세그먼트가 담긴 TranscribeResult.
@@ -273,16 +284,36 @@ def transcribe(
         segments 는 정렬/타이밍용으로 반복 환각만 정리한 세그먼트,
         processed_segments 는 export용으로 문단 분리 없이 동일한 후처리를 적용한 세그먼트다.
     """
+    def _progress(pct: float) -> None:
+        if progress_callback:
+            progress_callback(max(0.0, min(100.0, pct)))
+
+    def _status(message: str) -> None:
+        if status_callback:
+            status_callback(message)
+
+    def _postprocess_progress(pct: float, message: str) -> None:
+        _status(message)
+        _progress(84.0 + pct * 10.0 / 100.0)
+
     pipeline = _get_pipeline(model, language, initial_prompt)
 
-    start = time.time()
+    total_start = time.time()
+    stage_timings: Dict[str, float] = {}
+    _status("전사 중...")
+
+    inference_start = time.time()
+
+    def _inference_progress(pct: float) -> None:
+        _progress(pct * 84.0 / 100.0)
+
     raw_result = pipeline.transcribe(
         str(audio_path),
         language=language,
         verbose=verbose,
-        progress_callback=progress_callback,
+        progress_callback=_inference_progress if progress_callback else None,
     )
-    elapsed = time.time() - start
+    stage_timings["inference"] = time.time() - inference_start
 
     segments: List[dict] = list(raw_result.get("segments", []))
     detected_language = raw_result.get("language", language or "ko")
@@ -291,29 +322,52 @@ def transcribe(
     raw_text = " ".join(seg.get("text", "").strip() for seg in segments).strip()
 
     # v0.6 통합 후처리: clean_hallucinations → glossary → KSS normalize/spacing → paragraphs
+    _status("텍스트 정리 중...")
+    text_post_start = time.time()
     cleaned_text = full_postprocess(
         raw_text,
         use_glossary=use_glossary,
         use_korean_norm=use_korean_norm,
         glossary=glossary,
+        progress_callback=_postprocess_progress,
+        warning_callback=warning_callback,
+        debug=debug,
     )
+    stage_timings["text_postprocess"] = time.time() - text_post_start
     # align/word timestamp 는 원문과 가까운 세그먼트가 더 안전하므로 최소 정리본을 유지한다.
+    _status("세그먼트 정리 중...")
+    clean_seg_start = time.time()
     cleaned_segments = clean_segments(segments)
+    stage_timings["segment_cleanup"] = time.time() - clean_seg_start
+    _progress(95.0 if build_processed_segments else 100.0)
     # export/timestamp/SRT 는 일반 텍스트 결과와 최대한 동일한 후처리를 따르도록 별도 보관한다.
-    processed_segments = postprocess_segments(
-        segments,
-        use_glossary=use_glossary,
-        use_korean_norm=use_korean_norm,
-        glossary=glossary,
-    )
+    processed_segments: List[dict] = []
+    if build_processed_segments:
+        _status("타임스탬프 세그먼트 정리 중...")
+        processed_seg_start = time.time()
+        processed_segments = postprocess_segments(
+            segments,
+            use_glossary=use_glossary,
+            use_korean_norm=use_korean_norm,
+            glossary=glossary,
+            progress_callback=lambda pct: _progress(95.0 + pct * 5.0 / 100.0),
+            warning_callback=warning_callback,
+            debug=debug,
+        )
+        stage_timings["segment_postprocess"] = time.time() - processed_seg_start
+
+    stage_timings["total"] = time.time() - total_start
+    _status("전사 완료")
+    _progress(100.0)
 
     return TranscribeResult(
         text=cleaned_text,
         language=detected_language,
-        duration_seconds=elapsed,
+        duration_seconds=stage_timings["total"],
         segments=cleaned_segments,
         processed_segments=processed_segments,
         audio_path=str(audio_path),
+        stage_timings=stage_timings,
     )
 
 
