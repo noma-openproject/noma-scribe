@@ -33,6 +33,7 @@ def run_transcription(
     end_time: str,
     use_glossary: bool,
     use_korean_norm: bool,
+    debug_mode: bool,
     progress=gr.Progress(),
 ):
     options = BatchTranscriptionOptions(
@@ -43,6 +44,7 @@ def run_transcription(
         end_time=end_time,
         use_glossary=use_glossary,
         use_korean_norm=use_korean_norm,
+        debug_mode=debug_mode,
     )
 
     result = transcribe_batch(
@@ -144,6 +146,10 @@ def create_app():
                                 label="한국어 문장 정리 (KSS 띄어쓰기 + 문단 분리)",
                                 value=True,
                             )
+                            debug_mode_check = gr.Checkbox(
+                                label="디버그 모드 (상세 로그/예외 표시)",
+                                value=False,
+                            )
 
                         transcribe_btn = gr.Button(
                             "🎙️ 전사 시작",
@@ -154,6 +160,7 @@ def create_app():
                     with gr.Column(scale=1):
                         status_text = gr.Textbox(
                             label="상태",
+                            lines=12,
                             interactive=False,
                             elem_classes=["status-box"],
                         )
@@ -251,6 +258,7 @@ def create_app():
             inputs=[
                 audio_input, mode_select, two_pass_check, format_select,
                 start_time_in, end_time_in, use_glossary_check, use_korean_norm_check,
+                debug_mode_check,
             ],
             outputs=[output_text, download_file, status_text, keywords_table, glossary_table, clusters_state],
         )

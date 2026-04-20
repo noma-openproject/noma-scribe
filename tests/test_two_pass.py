@@ -34,15 +34,53 @@ def test_two_pass_transcribe_passes_postprocess_options(monkeypatch):
 
     two_pass.two_pass_transcribe(
         audio_path="sample.m4a",
-        use_glossary=False,
-        use_korean_norm=False,
+        use_glossary=True,
+        use_korean_norm=True,
         glossary=glossary,
+        build_processed_segments=True,
     )
 
     assert len(calls) == 2
     assert calls[0]["use_glossary"] is False
     assert calls[0]["use_korean_norm"] is False
     assert calls[0]["glossary"] == glossary
-    assert calls[1]["use_glossary"] is False
-    assert calls[1]["use_korean_norm"] is False
+    assert calls[0]["build_processed_segments"] is False
+    assert calls[1]["use_glossary"] is True
+    assert calls[1]["use_korean_norm"] is True
     assert calls[1]["glossary"] == glossary
+    assert calls[1]["build_processed_segments"] is True
+
+
+def test_two_pass_transcribe_without_terms_reprocesses_pass1(monkeypatch):
+    def fake_transcribe(*args, **kwargs):
+        return TranscribeResult(
+            text="프레모가 좋다.",
+            language="ko",
+            duration_seconds=0.1,
+            segments=[{"start": 0.0, "end": 1.0, "text": "프레모가 좋다."}],
+            processed_segments=[],
+            audio_path="sample.m4a",
+        )
+
+    monkeypatch.setattr(two_pass, "transcribe", fake_transcribe)
+    monkeypatch.setattr(two_pass, "extract_terms", lambda text: [])
+    monkeypatch.setattr(
+        two_pass,
+        "full_postprocess",
+        lambda text, **kwargs: f"[final]{text}",
+    )
+    monkeypatch.setattr(
+        two_pass,
+        "postprocess_segments",
+        lambda segments, **kwargs: [{"start": 0.0, "end": 1.0, "text": "[seg]"}],
+    )
+
+    result = two_pass.two_pass_transcribe(
+        audio_path="sample.m4a",
+        use_glossary=True,
+        use_korean_norm=True,
+        build_processed_segments=True,
+    )
+
+    assert result.text == "[final]프레모가 좋다."
+    assert result.processed_segments == [{"start": 0.0, "end": 1.0, "text": "[seg]"}]

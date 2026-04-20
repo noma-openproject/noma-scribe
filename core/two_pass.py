@@ -13,10 +13,12 @@ LLM 사용하지 않음.
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter
 from typing import Callable, List, Optional, Set
 
 from core.engine import TranscribeResult, transcribe
+from core.postprocess import full_postprocess, postprocess_segments
 
 
 # ──────────────────────────────────────────────
@@ -124,9 +126,12 @@ def two_pass_transcribe(
     model: str = "mlx-community/whisper-large-v3-turbo",
     progress_callback: Optional[Callable[[float], None]] = None,
     status_callback: Optional[Callable[[str], None]] = None,
+    warning_callback: Optional[Callable[[str], None]] = None,
     use_glossary: bool = True,
     use_korean_norm: bool = True,
     glossary: Optional[dict] = None,
+    build_processed_segments: bool = True,
+    debug: bool = False,
 ) -> TranscribeResult:
     """2-pass 자동 용어 추출 전사.
 
@@ -136,9 +141,12 @@ def two_pass_transcribe(
         model: Whisper 모델
         progress_callback: 0~100 진행률 콜백
         status_callback: 상태 메시지 콜백 ("1차 전사 중..." 등)
+        warning_callback: 경고 메시지 콜백
         use_glossary: 사용자 용어집 치환 여부
         use_korean_norm: KSS 기반 한국어 정규화 여부
         glossary: 용어집 dict (None 이면 기본 경로에서 로드)
+        build_processed_segments: export용 세그먼트 후처리 여부
+        debug: True 이면 내부 후처리 예외를 숨기지 않는다.
 
     Returns:
         2차 전사 결과 (TranscribeResult)
@@ -151,6 +159,9 @@ def two_pass_transcribe(
         if progress_callback:
             progress_callback(pct)
 
+    total_start = time.time()
+    stage_timings = {}
+
     # ── 1차 전사: 프롬프트 없이 ──
     _status("1차 전사 중...")
 
@@ -158,31 +169,79 @@ def two_pass_transcribe(
         # 1차 = 0~40%
         _progress(pct * 0.4)
 
+    def _pass1_status(msg: str):
+        _status(f"1차 {msg}")
+
     pass1_result = transcribe(
         audio_path=audio_path,
         language=language,
         model=model,
         initial_prompt=None,
         progress_callback=_pass1_progress,
-        use_glossary=use_glossary,
-        use_korean_norm=use_korean_norm,
+        status_callback=_pass1_status,
+        warning_callback=warning_callback,
+        # 1차는 용어 추출용이므로 무거운 용어집/KSS 후처리는 생략한다.
+        use_glossary=False,
+        use_korean_norm=False,
         glossary=glossary,
+        build_processed_segments=False,
+        debug=debug,
     )
+    for name, seconds in pass1_result.stage_timings.items():
+        stage_timings[f"pass1.{name}"] = seconds
 
     # ── 용어 추출 ──
     _status("용어 추출 중...")
     _progress(42)
 
+    extract_start = time.time()
     terms = extract_terms(pass1_result.text)
     prompt = build_prompt_from_terms(terms) if terms else None
+    stage_timings["term_extraction"] = time.time() - extract_start
 
     _progress(45)
 
     if not prompt:
         # 추출할 용어가 없으면 1차 결과 그대로 반환
-        _status("용어 없음 — 1차 결과 사용")
+        _status("용어 없음 — 1차 결과 정리 중...")
+
+        processed_segments = []
+        seg_post_start = time.time()
+        if build_processed_segments:
+            processed_segments = postprocess_segments(
+                pass1_result.segments,
+                use_glossary=use_glossary,
+                use_korean_norm=use_korean_norm,
+                glossary=glossary,
+                progress_callback=lambda pct: _progress(80 + pct * 0.20),
+                warning_callback=warning_callback,
+                debug=debug,
+            )
+        if build_processed_segments:
+            stage_timings["pass1.segment_postprocess_final"] = time.time() - seg_post_start
+
+        final_text_start = time.time()
+        final_text = full_postprocess(
+            pass1_result.text,
+            use_glossary=use_glossary,
+            use_korean_norm=use_korean_norm,
+            glossary=glossary,
+            progress_callback=lambda pct, _msg: _progress(45 + pct * 0.35),
+            warning_callback=warning_callback,
+            debug=debug,
+        )
+        stage_timings["pass1.text_postprocess_final"] = time.time() - final_text_start
+        stage_timings["total"] = time.time() - total_start
         _progress(100)
-        return pass1_result
+        return TranscribeResult(
+            text=final_text,
+            language=pass1_result.language,
+            duration_seconds=stage_timings["total"],
+            segments=pass1_result.segments,
+            processed_segments=processed_segments,
+            audio_path=pass1_result.audio_path,
+            stage_timings=stage_timings,
+        )
 
     # ── 2차 전사: 추출 용어를 프롬프트에 ──
     _status(f"2차 전사 중... (용어 {len(terms)}개 적용)")
@@ -191,21 +250,39 @@ def two_pass_transcribe(
         # 2차 = 45~95%
         _progress(45 + pct * 0.50)
 
+    def _pass2_status(msg: str):
+        _status(f"2차 {msg}")
+
     pass2_result = transcribe(
         audio_path=audio_path,
         language=language,
         model=model,
         initial_prompt=prompt,
         progress_callback=_pass2_progress,
+        status_callback=_pass2_status,
+        warning_callback=warning_callback,
         use_glossary=use_glossary,
         use_korean_norm=use_korean_norm,
         glossary=glossary,
+        build_processed_segments=build_processed_segments,
+        debug=debug,
     )
+    for name, seconds in pass2_result.stage_timings.items():
+        stage_timings[f"pass2.{name}"] = seconds
 
     _status("후처리 중...")
     _progress(97)
 
+    stage_timings["total"] = time.time() - total_start
     _progress(100)
     _status("완료")
 
-    return pass2_result
+    return TranscribeResult(
+        text=pass2_result.text,
+        language=pass2_result.language,
+        duration_seconds=stage_timings["total"],
+        segments=pass2_result.segments,
+        processed_segments=pass2_result.processed_segments,
+        audio_path=pass2_result.audio_path,
+        stage_timings=stage_timings,
+    )

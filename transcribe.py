@@ -11,8 +11,11 @@
 
 import argparse
 import sys
+import time
+import traceback
 from pathlib import Path
 
+from core.diagnostics import RunDiagnostics, format_stage_timings
 from core.engine import resolve_model_path, save_result, slice_audio, transcribe
 from core.keywords import extract_keywords, format_keywords
 from core.srt import save_srt
@@ -63,6 +66,8 @@ def create_parser() -> argparse.ArgumentParser:
                         help="전사 후 키워드 빈도 Top 15 표시")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="세그먼트별 실시간 출력")
+    parser.add_argument("--debug", action="store_true",
+                        help="상세 로그와 traceback 출력")
 
     return parser
 
@@ -82,6 +87,7 @@ def main():
         sys.exit(1)
 
     print_header()
+    diagnostics = RunDiagnostics(origin="cli", debug=args.debug)
 
     # 포맷 결정
     if args.timestamps:
@@ -109,11 +115,13 @@ def main():
     if args.start or args.end:
         print(f"  구간:   {args.start or '처음'} ~ {args.end or '끝'}")
     print(f"  파일:   {len(audio_files)}개")
+    print(f"  로그:   {diagnostics.log_path}")
     print()
 
     total_elapsed = 0.0
     success_count = 0
     all_texts = []
+    build_processed_segments = args.format != "txt"
 
     for i, audio_path in enumerate(audio_files, 1):
         prefix = f"  [{i}/{len(audio_files)}]"
@@ -125,10 +133,13 @@ def main():
         sliced = False
         if args.start or args.end:
             try:
+                slice_start = time.time()
                 actual_path = slice_audio(str(audio_path), args.start, args.end)
                 sliced = actual_path != str(audio_path)
+                diagnostics.stage(f"{audio_path.name}.slice_audio", time.time() - slice_start)
             except Exception as e:
                 print(f"         ⚠️ 구간 자르기 실패: {e}")
+                diagnostics.note(f"warn slice_audio {audio_path.name}: {e}")
 
         print(f"         {mode_label} 전사 중...", end="", flush=True)
 
@@ -138,6 +149,9 @@ def main():
                     audio_path=actual_path,
                     language=args.lang,
                     model=model,
+                    build_processed_segments=build_processed_segments,
+                    warning_callback=lambda message: diagnostics.note(f"warn {audio_path.name}: {message}"),
+                    debug=args.debug,
                 )
             else:
                 result = transcribe(
@@ -145,9 +159,15 @@ def main():
                     language=args.lang,
                     model=model,
                     verbose=args.verbose,
+                    build_processed_segments=build_processed_segments,
+                    warning_callback=lambda message: diagnostics.note(f"warn {audio_path.name}: {message}"),
+                    debug=args.debug,
                 )
 
+            diagnostics.stage_map(audio_path.name, result.stage_timings)
+
             # 결과 저장
+            save_start = time.time()
             if args.format == "srt":
                 output_path = build_output_path(audio_path, args.output)
                 output_path = output_path.with_suffix(".srt")
@@ -156,6 +176,7 @@ def main():
                 output_path = build_output_path(audio_path, args.output)
                 save_result(result, output_path,
                             include_timestamps=(args.format == "timestamps"))
+            diagnostics.stage(f"{audio_path.name}.save_result", time.time() - save_start)
 
             elapsed_str = format_duration(result.duration_seconds)
             total_elapsed += result.duration_seconds
@@ -163,6 +184,11 @@ def main():
             all_texts.append(result.text)
 
             print(f"\r         ✅ 완료 ({elapsed_str}) → {output_path.name}")
+            stage_summary = format_stage_timings(result.stage_timings)
+            if stage_summary:
+                print("         단계별 소요:")
+                for line in stage_summary.splitlines():
+                    print(f"         {line}")
 
             if not args.verbose and result.text:
                 preview = result.text[:100] + ("..." if len(result.text) > 100 else "")
@@ -171,6 +197,9 @@ def main():
 
         except Exception as e:
             print(f"\r         ❌ 실패: {e}")
+            diagnostics.exception(audio_path.name, str(e), traceback.format_exc())
+            if args.debug:
+                print(traceback.format_exc().rstrip())
             print()
         finally:
             if sliced and Path(actual_path).exists():
