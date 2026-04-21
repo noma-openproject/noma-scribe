@@ -15,9 +15,18 @@ temperature, condition_on_previous_text=False)는 `mlx_whisper.transcribe`를
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+# 현재 앱 경로에서는 pyannote의 torchcodec decoder를 사용하지 않는데,
+# whispermlx import 시 환경 경고가 크게 출력되어 실제 진행 로그를 가린다.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torchcodec is not installed correctly.*",
+    category=UserWarning,
+)
 
 import mlx_whisper  # whispermlx 의 백엔드이기도 함
 import whispermlx

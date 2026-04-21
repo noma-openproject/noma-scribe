@@ -4,6 +4,12 @@
 
 set -e
 
+OS_NAME="$(uname -s)"
+BREW_PREFIX=""
+if command -v brew &> /dev/null; then
+    BREW_PREFIX="$(brew --prefix)"
+fi
+
 echo ""
 echo "  🎙️  noma-scribe 설치"
 echo "  ─────────────────────"
@@ -20,6 +26,51 @@ else
         echo "  ❌ Homebrew가 필요합니다."
         echo "     설치: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
         exit 1
+    fi
+fi
+
+# 1.2. torchcodec 호환용 ffmpeg@7 라이브러리 준비
+if [ -n "$BREW_PREFIX" ]; then
+    if brew list --versions ffmpeg@7 &> /dev/null; then
+        echo "  ✅ ffmpeg@7 이미 설치됨"
+    else
+        echo "  📦 ffmpeg@7 설치 중... (torchcodec 호환)"
+        brew install ffmpeg@7
+    fi
+
+    if [ "$OS_NAME" = "Darwin" ]; then
+        FFMPEG7_PREFIX="$(brew --prefix ffmpeg@7)"
+        mkdir -p "$BREW_PREFIX/lib"
+        for lib_name in avutil avcodec avformat avdevice avfilter swscale swresample; do
+            target="$(find "$FFMPEG7_PREFIX/lib" -maxdepth 1 -name "lib${lib_name}.*.dylib" | head -n 1)"
+            if [ -z "$target" ]; then
+                echo "  ⚠️  lib${lib_name}.*.dylib 를 찾지 못했습니다."
+                continue
+            fi
+
+            link="$BREW_PREFIX/lib/$(basename "$target")"
+            if [ -e "$link" ] || [ -L "$link" ]; then
+                continue
+            fi
+            ln -s "$target" "$link"
+        done
+    fi
+fi
+
+# 1.5. mecab-ko 설치 (KSS 한국어 정리 가속)
+if [ -n "$BREW_PREFIX" ]; then
+    if brew list --versions mecab-ko mecab-ko-dic &> /dev/null; then
+        echo "  ✅ mecab-ko 이미 설치됨"
+    else
+        echo "  📦 mecab-ko 설치 중... (KSS 가속)"
+        brew install mecab-ko mecab-ko-dic
+    fi
+
+    MECABRC="$BREW_PREFIX/etc/mecabrc"
+    MECAB_DIC_DIR="$(brew --prefix mecab-ko-dic)/lib/mecab/dic/mecab-ko-dic"
+    if [ -f "$MECABRC" ] && ! grep -q "$MECAB_DIC_DIR" "$MECABRC" 2>/dev/null; then
+        echo "" >> "$MECABRC"
+        echo "dicdir = $MECAB_DIC_DIR" >> "$MECABRC"
     fi
 fi
 
@@ -65,6 +116,11 @@ echo "  📦 의존성 설치 중..."
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip -q
 pip install -r requirements.txt -q
+
+if command -v mecab-config &> /dev/null; then
+    echo "  📦 python-mecab-ko 설치 중... (KSS 가속)"
+    pip install python-mecab-ko -q || echo "  ⚠️  python-mecab-ko 설치 실패 — pecab fallback 유지"
+fi
 
 # 4. 실행 파일 권한 설정
 chmod +x noma-scribe.command 2>/dev/null

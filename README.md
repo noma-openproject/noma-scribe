@@ -51,10 +51,15 @@ chmod +x setup.sh
 `setup.sh`가 자동으로:
 
 1. `ffmpeg` 확인 후 없으면 설치
-2. Python 3.10+ 탐지
-3. `.venv/` 생성
-4. 의존성 설치
-5. `noma-scribe.command` 실행 권한 부여
+2. `ffmpeg@7` 호환 라이브러리 연결 준비
+3. `mecab-ko` / `python-mecab-ko` 설치
+4. Python 3.10+ 탐지
+5. `.venv/` 생성
+6. 의존성 설치
+7. `noma-scribe.command` 실행 권한 부여
+
+Homebrew 경로는 `brew --prefix`로 자동 탐지하므로 `/opt/homebrew`가 아닌 환경도
+하드코딩 없이 설치됩니다.
 
 첫 실행 시 Whisper 모델이 다운로드될 수 있어서 네트워크 상태에 따라 몇 분 걸릴 수 있습니다.
 
@@ -239,6 +244,11 @@ rm -rf .venv
 **`ffmpeg not found`**
 
 Homebrew를 설치한 뒤 `./setup.sh`를 다시 실행하세요.
+
+**`torchcodec` / `pyannote` 경고가 보입니다**
+
+최신 `setup.sh`는 `ffmpeg@7` 호환 라이브러리와 KSS용 `mecab-ko`까지 함께 정리합니다.
+기존 환경이라면 `./setup.sh`를 한 번 더 실행한 뒤 앱을 다시 시작하세요.
 
 **모델 다운로드가 느립니다**
 

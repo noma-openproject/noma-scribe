@@ -180,7 +180,7 @@ def create_app():
                             headers=["단어", "빈도"],
                             datatype=["str", "number"],
                             column_count=(2, "fixed"),
-                            row_count=(5, "dynamic"),
+                            row_count=5,
                             interactive=False,
                         )
                         with gr.Row():
@@ -218,7 +218,7 @@ def create_app():
                     headers=["표준형 (canonical)", "별칭 (aliases, 쉼표 구분)"],
                     datatype=["str", "str"],
                     column_count=(2, "fixed"),
-                    row_count=(5, "dynamic"),
+                    row_count=5,
                     interactive=False,
                     value=refresh_glossary_display(),
                 )
